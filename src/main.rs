@@ -1,5 +1,6 @@
-//! Generic Extractor - Hierarchical document extraction server.
+//! Generic Extractor - Config-driven hierarchical document extraction server.
 
+mod config;
 mod content_store;
 mod extractor;
 mod openrouter;
@@ -12,6 +13,7 @@ use axum::{
     routing::{get, post},
     Router,
 };
+use config::ConfigStore;
 use content_store::{ContentChunk, ContentStore};
 use extractor::Extractor;
 use openrouter::OpenRouterClient;
@@ -29,6 +31,7 @@ struct AppState {
     extractions: Arc<RwLock<HashMap<String, Extraction>>>,
     content_store: ContentStore,
     openrouter: Arc<OpenRouterClient>,
+    configs: Arc<ConfigStore>,
 }
 
 #[tokio::main]
@@ -43,6 +46,11 @@ async fn main() -> anyhow::Result<()> {
         .with(tracing_subscriber::fmt::layer())
         .init();
 
+    // Load configs from filesystem
+    let config_dir = std::path::Path::new("configs");
+    let configs = ConfigStore::load_from_dir(config_dir)?;
+    info!("Loaded {} configs: {:?}", configs.list().len(), configs.list());
+
     // Initialize OpenRouter client
     let openrouter = OpenRouterClient::from_env()?;
     info!("OpenRouter client initialized");
@@ -52,11 +60,14 @@ async fn main() -> anyhow::Result<()> {
         extractions: Arc::new(RwLock::new(HashMap::new())),
         content_store: ContentStore::new(),
         openrouter: Arc::new(openrouter),
+        configs: Arc::new(configs),
     };
 
     // Build router
     let app = Router::new()
         .route("/health", get(health))
+        .route("/configs", get(list_configs))
+        .route("/configs/{name}", get(get_config))
         .route("/extract", post(extract_document))
         .route("/extractions/{id}", get(get_extraction))
         .route("/extractions/{id}/node/{node_id}", get(get_node))
@@ -83,11 +94,42 @@ async fn health() -> &'static str {
     "ok"
 }
 
+/// List available configs.
+async fn list_configs(
+    State(state): State<AppState>,
+) -> Json<Vec<String>> {
+    Json(state.configs.list().iter().map(|s| s.to_string()).collect())
+}
+
+/// Get a specific config.
+async fn get_config(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> Result<Json<config::ExtractionConfig>, StatusCode> {
+    state.configs
+        .get(&name)
+        .cloned()
+        .map(Json)
+        .ok_or(StatusCode::NOT_FOUND)
+}
+
+#[derive(serde::Deserialize)]
+struct ExtractQuery {
+    config: Option<String>,
+}
+
 /// Upload a document and extract its structure.
 async fn extract_document(
     State(state): State<AppState>,
+    Query(query): Query<ExtractQuery>,
     mut multipart: Multipart,
 ) -> Result<Json<Extraction>, (StatusCode, String)> {
+    // Get the config
+    let config_name = query.config.as_deref().unwrap_or("legal_br");
+    let config = state.configs.get(config_name).ok_or_else(|| {
+        (StatusCode::BAD_REQUEST, format!("Unknown config: {}. Available: {:?}", config_name, state.configs.list()))
+    })?;
+
     // Read the uploaded file
     let mut filename = String::new();
     let mut file_data = Vec::new();
@@ -108,16 +150,15 @@ async fn extract_document(
         return Err((StatusCode::BAD_REQUEST, "No file uploaded".to_string()));
     }
 
-    info!("Received file: {} ({} bytes)", filename, file_data.len());
+    info!("Received file: {} ({} bytes) with config: {}", filename, file_data.len(), config_name);
 
-    // Extract text from PDF (basic extraction)
+    // Extract text from PDF
     let text_content = if filename.to_lowercase().ends_with(".pdf") {
         extract_pdf_text(&file_data).unwrap_or_else(|e| {
             error!("PDF extraction failed: {}", e);
             String::new()
         })
     } else {
-        // Assume plain text
         String::from_utf8_lossy(&file_data).to_string()
     };
 
@@ -128,14 +169,14 @@ async fn extract_document(
         ));
     }
 
-    // Run extraction
+    // Run extraction with config
     let extractor = Extractor::new(
         (*state.openrouter).clone(),
         state.content_store.clone(),
     );
 
     let extraction = extractor
-        .extract(&filename, &text_content, None)
+        .extract(&filename, &text_content, None, config)
         .await
         .map_err(|e| {
             error!("Extraction failed: {}", e);

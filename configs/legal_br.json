@@ -1,0 +1,137 @@
+{
+    "name": "legal_br",
+    "description": "Brazilian legal case files (cópias integrais de processos judiciais)",
+    "prompts": {
+        "structure": "Você é um analisador especializado em documentos jurídicos brasileiros. Analise o documento fornecido e extraia sua estrutura hierárquica.\n\nIdentifique:\n1. Tipo de documento (petição, decisão, recurso, certidão, documento)\n2. Seções dentro de cada documento\n3. Intervalos de páginas\n4. Autores e datas quando visíveis\n5. Referências cruzadas entre documentos\n\nRetorne um objeto JSON com esta estrutura:\n{\n  \"summary\": \"Resumo de 2-4 frases do documento completo\",\n  \"metadata\": {\n    \"numero\": \"número do processo (formato CNJ)\",\n    \"classe\": \"classe processual\",\n    \"orgao_julgador\": \"órgão julgador\",\n    \"partes\": [{\"id\": \"parte_1\", \"nome\": \"Nome\", \"polo\": \"ATIVO ou PASSIVO\"}]\n  },\n  \"children\": [\n    {\n      \"id\": \"id_unico\",\n      \"type\": \"PETICAO|DECISAO|RECURSO|CERTIDAO|DOCUMENTO|GRUPO|SECTION\",\n      \"subtype\": \"Tipo específico (ex: Petição Inicial, Contestação)\",\n      \"label\": \"Rótulo para exibição\",\n      \"page_range\": [inicio, fim],\n      \"date\": \"YYYY-MM-DD se conhecido\",\n      \"author\": \"Nome do autor\",\n      \"summary\": \"Resumo de 2-4 frases\",\n      \"children\": []\n    }\n  ],\n  \"relationships\": [\n    {\"from\": \"id_origem\", \"to\": \"id_destino\", \"type\": \"responds_to|references|decides_on|appeals\"}\n  ]\n}\n\nSeja detalhado mas conciso. Foque na estrutura do documento, não na extração completa do conteúdo."
+    },
+    "node_types": [
+        {
+            "id": "PETICAO",
+            "label": "Petição",
+            "subtypes": [
+                "Inicial",
+                "Contestação",
+                "Réplica",
+                "Tréplica",
+                "Embargos"
+            ]
+        },
+        {
+            "id": "DECISAO",
+            "label": "Decisão",
+            "subtypes": [
+                "Despacho",
+                "Decisão Interlocutória",
+                "Sentença",
+                "Acórdão"
+            ]
+        },
+        {
+            "id": "RECURSO",
+            "label": "Recurso",
+            "subtypes": [
+                "Apelação",
+                "Agravo",
+                "Embargos de Declaração"
+            ]
+        },
+        {
+            "id": "CERTIDAO",
+            "label": "Certidão",
+            "subtypes": [
+                "Intimação",
+                "Publicação",
+                "Trânsito em Julgado"
+            ]
+        },
+        {
+            "id": "DOCUMENTO",
+            "label": "Documento",
+            "subtypes": [
+                "Procuração",
+                "Comprovante",
+                "Laudo",
+                "Ata"
+            ]
+        },
+        {
+            "id": "GRUPO",
+            "label": "Grupo",
+            "subtypes": []
+        },
+        {
+            "id": "SECTION",
+            "label": "Seção",
+            "subtypes": []
+        }
+    ],
+    "relationship_types": [
+        "responds_to",
+        "references",
+        "decides_on",
+        "appeals",
+        "cites",
+        "amends"
+    ],
+    "metadata_schema": {
+        "numero": {
+            "type": "string",
+            "description": "Número do processo (formato CNJ: NNNNNNN-DD.AAAA.J.TR.OOOO)"
+        },
+        "classe": {
+            "type": "string",
+            "description": "Classe processual"
+        },
+        "orgao_julgador": {
+            "type": "string",
+            "description": "Órgão julgador (vara, turma, câmara)"
+        },
+        "assuntos": {
+            "type": "array",
+            "items": {
+                "type": "string"
+            },
+            "description": "Assuntos do processo"
+        },
+        "valor_causa": {
+            "type": "number",
+            "description": "Valor da causa em reais"
+        },
+        "justica_gratuita": {
+            "type": "boolean",
+            "description": "Se há pedido de justiça gratuita"
+        },
+        "partes": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "id": {
+                        "type": "string"
+                    },
+                    "nome": {
+                        "type": "string"
+                    },
+                    "polo": {
+                        "type": "string",
+                        "enum": [
+                            "ATIVO",
+                            "PASSIVO",
+                            "TERCEIRO"
+                        ]
+                    },
+                    "tipo_pessoa": {
+                        "type": "string",
+                        "enum": [
+                            "FÍSICA",
+                            "JURÍDICA"
+                        ]
+                    },
+                    "cpf_cnpj": {
+                        "type": "string"
+                    }
+                }
+            }
+        }
+    }
+}

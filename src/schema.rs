@@ -1,6 +1,7 @@
-//! Hierarchical document extraction schema types.
+//! Generic hierarchical document extraction schema types.
 //!
-//! These types match the JSON Schema defined in `plan/initial-schema/extraction_schema.json`.
+//! This schema is config-independent. Domain-specific metadata is stored as
+//! dynamic JSON values, with the structure defined by the extraction config.
 
 use serde::{Deserialize, Serialize};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -12,15 +13,12 @@ pub fn now_iso8601() -> String {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
     let secs = duration.as_secs();
-    // Simple UTC timestamp without external deps
-    // Format: 2025-02-05T12:00:00Z
     let days_since_epoch = secs / 86400;
     let time_of_day = secs % 86400;
     let hours = time_of_day / 3600;
     let minutes = (time_of_day % 3600) / 60;
     let seconds = time_of_day % 60;
     
-    // Simplified date calculation (good enough for timestamps)
     let mut year = 1970i32;
     let mut remaining_days = days_since_epoch as i32;
     
@@ -64,30 +62,37 @@ fn is_leap_year(year: i32) -> bool {
 pub struct Extraction {
     pub id: String,
     pub version: u32,
+    /// Which config was used for this extraction
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub config_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub previous_version_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content_hash: Option<String>,
     pub source_file: String,
-    pub extracted_at: String, // ISO8601 timestamp
+    pub extracted_at: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub extractor_version: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub total_pages: Option<u32>,
     pub summary: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub structure_map: Vec<StructureMapEntry>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub relationships: Vec<Relationship>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub metadata: Option<ProcessoMetadata>,
+    /// Dynamic metadata - structure defined by config
+    #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
+    pub metadata: serde_json::Value,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub children: Vec<DocumentNode>,
 }
 
 impl Extraction {
-    pub fn new(source_file: String) -> Self {
+    pub fn new(source_file: String, config_name: Option<String>) -> Self {
         Self {
             id: format!("ext_{}", Uuid::new_v4().simple()),
             version: 1,
+            config_name,
             previous_version_id: None,
             content_hash: None,
             source_file,
@@ -97,7 +102,7 @@ impl Extraction {
             summary: String::new(),
             structure_map: Vec::new(),
             relationships: Vec::new(),
-            metadata: None,
+            metadata: serde_json::Value::Null,
             children: Vec::new(),
         }
     }
@@ -118,132 +123,17 @@ pub struct Relationship {
     pub from: String,
     pub to: String,
     #[serde(rename = "type")]
-    pub rel_type: RelationshipType,
+    pub rel_type: String,  // Now a string, validated against config
     #[serde(skip_serializing_if = "Option::is_none")]
     pub citation: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RelationshipType {
-    RespondsTo,
-    References,
-    DecidesOn,
-    Appeals,
-    Cites,
-    Amends,
-    Supersedes,
-}
-
-/// Metadata for Brazilian judicial processes.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ProcessoMetadata {
-    pub id: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub summary: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub numero: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub classe: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub orgao_julgador: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub ultima_distribuicao: Option<String>, // YYYY-MM-DD
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub valor_causa: Option<f64>,
-    #[serde(default = "default_currency")]
-    pub valor_causa_moeda: String,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub assuntos: Vec<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub nivel_sigilo: Option<i32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub justica_gratuita: Option<bool>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub partes: Vec<Parte>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub terceiros: Vec<Parte>,
-}
-
-fn default_currency() -> String {
-    "BRL".to_string()
-}
-
-/// Party in a judicial process.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Parte {
-    pub id: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub polo: Option<Polo>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub qualificacao: Option<String>,
-    pub nome: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub tipo_pessoa: Option<TipoPessoa>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub documentos: Option<Documentos>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub endereco: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub representante_legal: Option<RepresentanteLegal>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub advogados: Vec<Advogado>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "UPPERCASE")]
-pub enum Polo {
-    Ativo,
-    Passivo,
-    Terceiro,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum TipoPessoa {
-    #[serde(rename = "FÍSICA")]
-    Fisica,
-    #[serde(rename = "JURÍDICA")]
-    Juridica,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Documentos {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub cpf: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub cnpj: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub rg: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RepresentanteLegal {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub nome: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub relacao: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub cpf: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Advogado {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub nome: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub oab: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub email: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub telefones: Vec<String>,
-}
-
-/// A node in the document tree (document, section, group, etc.).
+/// A node in the document tree.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DocumentNode {
     pub id: String,
     #[serde(rename = "type")]
-    pub node_type: DocumentNodeType,
+    pub node_type: String,  // Now a string, validated against config
     #[serde(skip_serializing_if = "Option::is_none")]
     pub subtype: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -251,9 +141,7 @@ pub struct DocumentNode {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub page_range: Option<[u32; 2]>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub pdf_page_range: Option<[u32; 2]>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub date: Option<String>, // YYYY-MM-DD
+    pub date: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub author: Option<String>,
     pub summary: String,
@@ -265,23 +153,11 @@ pub struct DocumentNode {
     pub content_ref: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub confidence: Option<ConfidenceScores>,
+    /// Node-level dynamic metadata
+    #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
+    pub metadata: serde_json::Value,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub children: Vec<DocumentNode>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "UPPERCASE")]
-pub enum DocumentNodeType {
-    #[serde(rename = "PETIÇÃO")]
-    Peticao,
-    #[serde(rename = "DECISÃO")]
-    Decisao,
-    Recurso,
-    #[serde(rename = "CERTIDÃO")]
-    Certidao,
-    Documento,
-    Grupo,
-    Section,
 }
 
 /// Embedded cross-reference within a node.

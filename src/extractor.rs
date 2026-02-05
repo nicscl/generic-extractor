@@ -1,56 +1,15 @@
 //! Document extraction pipeline using LLM.
 
+use crate::config::ExtractionConfig;
 use crate::content_store::ContentStore;
 use crate::openrouter::{Message, OpenRouterClient};
 use crate::schema::{
-    ConfidenceScores, DocumentNode, DocumentNodeType, EmbeddedReference, Extraction,
-    ProcessoMetadata, Relationship, RelationshipType, StructureMapEntry,
+    ConfidenceScores, DocumentNode, EmbeddedReference, Extraction,
+    Relationship, StructureMapEntry,
 };
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
 use tracing::{debug, info};
-
-/// System prompt for structure extraction.
-const STRUCTURE_PROMPT: &str = r#"You are a legal document analyzer. Analyze the provided document and extract its hierarchical structure.
-
-For Brazilian legal documents (cópia integral), identify:
-1. Document type (petição, decisão, recurso, certidão, documento)
-2. Sections within each document
-3. Page ranges
-4. Authors and dates when visible
-5. Cross-references between documents
-
-Return a JSON object with this structure:
-{
-  "summary": "2-4 sentence overview of the entire document",
-  "structure_map": [
-    {"id": "doc_id", "label": "Human Label", "children": ["child_id1", "child_id2"]}
-  ],
-  "metadata": {
-    "numero": "process number if visible",
-    "classe": "process class",
-    "orgao_julgador": "court",
-    "partes": [{"id": "parte_1", "nome": "Name", "polo": "ATIVO or PASSIVO"}]
-  },
-  "children": [
-    {
-      "id": "unique_id",
-      "type": "PETIÇÃO|DECISÃO|RECURSO|CERTIDÃO|DOCUMENTO|GRUPO|SECTION",
-      "subtype": "Specific type (e.g., Petição Inicial, Contestação)",
-      "label": "Display label for sections",
-      "page_range": [start, end],
-      "date": "YYYY-MM-DD if known",
-      "author": "Author name",
-      "summary": "2-4 sentence summary of this node",
-      "children": []
-    }
-  ],
-  "relationships": [
-    {"from": "node_id", "to": "target_id", "type": "responds_to|references|decides_on|appeals"}
-  ]
-}
-
-Be thorough but concise. Focus on the document structure, not full content extraction."#;
 
 /// Extraction pipeline orchestrator.
 pub struct Extractor {
@@ -66,18 +25,15 @@ impl Extractor {
         }
     }
 
-    /// Extract structure from a document.
-    ///
-    /// - `filename`: Original filename
-    /// - `text_content`: Extracted text from PDF (or OCR result)
-    /// - `images`: Optional page images for vision-based extraction
+    /// Extract structure from a document using the specified config.
     pub async fn extract(
         &self,
         filename: &str,
         text_content: &str,
         images: Option<Vec<Vec<u8>>>,
+        config: &ExtractionConfig,
     ) -> Result<Extraction> {
-        info!("Starting extraction for: {}", filename);
+        info!("Starting extraction for: {} using config: {}", filename, config.name);
 
         // Compute content hash
         let content_hash = {
@@ -86,13 +42,13 @@ impl Extractor {
             format!("{:x}", hasher.finalize())
         };
 
-        // Build messages for LLM
+        // Build messages using config prompt
         let messages = if let Some(image_data) = images {
             vec![
-                Message::system(STRUCTURE_PROMPT),
+                Message::system(&config.prompts.structure),
                 Message::user_with_images(
                     format!(
-                        "Analyze this document. Extracted text:\n\n{}",
+                        "Analyze this document:\n\n{}",
                         truncate_for_context(text_content, 50000)
                     ),
                     image_data,
@@ -100,7 +56,7 @@ impl Extractor {
             ]
         } else {
             vec![
-                Message::system(STRUCTURE_PROMPT),
+                Message::system(&config.prompts.structure),
                 Message::user(format!(
                     "Analyze this document:\n\n{}",
                     truncate_for_context(text_content, 100000)
@@ -112,44 +68,31 @@ impl Extractor {
         debug!("Calling LLM for structure extraction");
         let response = self.client.chat(messages).await?;
         
-        // Log raw response for debugging
         debug!("Raw LLM response length: {} chars", response.len());
-        debug!("Raw LLM response (first 2000 chars): {}", &response.chars().take(2000).collect::<String>());
 
         // Parse the JSON response
         let extracted: ExtractedStructure = parse_llm_json(&response)
-            .context(format!("Failed to parse LLM structure response. First 500 chars: {}", &response.chars().take(500).collect::<String>()))?;
+            .context("Failed to parse LLM structure response")?;
 
         // Build the Extraction object
-        let mut extraction = Extraction::new(filename.to_string());
+        let mut extraction = Extraction::new(filename.to_string(), Some(config.name.clone()));
         extraction.content_hash = Some(content_hash);
         extraction.summary = extracted.summary;
         extraction.structure_map = extracted.structure_map;
         
-        // Convert relationships from flexible to strict type
+        // Convert relationships
         extraction.relationships = extracted.relationships
             .into_iter()
-            .map(Relationship::from)
+            .map(|r| Relationship {
+                from: r.from,
+                to: r.to,
+                rel_type: r.rel_type,
+                citation: r.citation,
+            })
             .collect();
         
-        // Convert metadata if present
-        extraction.metadata = extracted.metadata.map(|m| {
-            ProcessoMetadata {
-                id: format!("meta_{}", uuid::Uuid::new_v4().simple()),
-                summary: None,
-                numero: m.numero,
-                classe: m.classe,
-                orgao_julgador: m.orgao_julgador,
-                ultima_distribuicao: None,
-                valor_causa: None,
-                valor_causa_moeda: "BRL".to_string(),
-                assuntos: Vec::new(),
-                nivel_sigilo: None,
-                justica_gratuita: None,
-                partes: Vec::new(), // TODO: parse partes from m.partes
-                terceiros: Vec::new(),
-            }
-        });
+        // Store metadata as-is (dynamic JSON)
+        extraction.metadata = extracted.metadata.unwrap_or(serde_json::Value::Null);
 
         // Process children and store content
         extraction.children = self.process_children(extracted.children, text_content)?;
@@ -173,7 +116,6 @@ impl Extractor {
 
         for node in nodes {
             let content_ref = if !node.id.is_empty() {
-                // Extract content for this node's page range if available
                 let content = extract_content_for_range(full_text, node.page_range);
                 if !content.is_empty() {
                     Some(self.content_store.store(&node.id, content))
@@ -188,11 +130,10 @@ impl Extractor {
 
             result.push(DocumentNode {
                 id: node.id,
-                node_type: parse_node_type(&node.node_type),
+                node_type: node.node_type,
                 subtype: node.subtype,
                 label: node.label,
                 page_range: node.page_range,
-                pdf_page_range: None,
                 date: node.date,
                 author: node.author,
                 summary: node.summary,
@@ -201,14 +142,15 @@ impl Extractor {
                     ref_type: r.ref_type,
                     citation: r.citation,
                 }).collect(),
-                referenced_by: Vec::new(), // Will be populated from relationships
+                referenced_by: Vec::new(),
                 content_ref,
                 confidence: Some(ConfidenceScores {
                     ocr: None,
-                    extraction: Some(0.8), // Default confidence
+                    extraction: Some(0.8),
                     summary: Some(0.85),
                     low_confidence_regions: Vec::new(),
                 }),
+                metadata: serde_json::Value::Null,
                 children,
             });
         }
@@ -229,7 +171,7 @@ struct ExtractedStructure {
     #[serde(default)]
     relationships: Vec<ExtractedRelationship>,
     #[serde(default)]
-    metadata: Option<ExtractedMetadata>,
+    metadata: Option<serde_json::Value>,
     #[serde(default)]
     children: Vec<ExtractedNode>,
 }
@@ -266,7 +208,6 @@ struct ExtractedRef {
     citation: Option<String>,
 }
 
-/// Flexible relationship type for LLM parsing (uses String instead of enum)
 #[derive(Debug, serde::Deserialize)]
 struct ExtractedRelationship {
     from: String,
@@ -277,62 +218,14 @@ struct ExtractedRelationship {
     citation: Option<String>,
 }
 
-impl From<ExtractedRelationship> for Relationship {
-    fn from(r: ExtractedRelationship) -> Self {
-        let rel_type = match r.rel_type.to_lowercase().as_str() {
-            "responds_to" => RelationshipType::RespondsTo,
-            "references" => RelationshipType::References,
-            "decides_on" => RelationshipType::DecidesOn,
-            "appeals" => RelationshipType::Appeals,
-            "cites" => RelationshipType::Cites,
-            "amends" => RelationshipType::Amends,
-            "supersedes" => RelationshipType::Supersedes,
-            _ => RelationshipType::References, // default fallback
-        };
-        Relationship {
-            from: r.from,
-            to: r.to,
-            rel_type,
-            citation: r.citation,
-        }
-    }
-}
-
-/// Flexible metadata for LLM parsing
-#[derive(Debug, Default, serde::Deserialize)]
-struct ExtractedMetadata {
-    #[serde(default)]
-    numero: Option<String>,
-    #[serde(default)]
-    classe: Option<String>,
-    #[serde(default)]
-    orgao_julgador: Option<String>,
-    #[serde(default)]
-    partes: Vec<serde_json::Value>, // Accept any format
-}
-
 // ============================================================================
 // Helper functions
 // ============================================================================
-
-fn parse_node_type(s: &str) -> DocumentNodeType {
-    match s.to_uppercase().as_str() {
-        "PETIÇÃO" | "PETICAO" => DocumentNodeType::Peticao,
-        "DECISÃO" | "DECISAO" => DocumentNodeType::Decisao,
-        "RECURSO" => DocumentNodeType::Recurso,
-        "CERTIDÃO" | "CERTIDAO" => DocumentNodeType::Certidao,
-        "DOCUMENTO" => DocumentNodeType::Documento,
-        "GRUPO" => DocumentNodeType::Grupo,
-        "SECTION" => DocumentNodeType::Section,
-        _ => DocumentNodeType::Documento,
-    }
-}
 
 fn truncate_for_context(text: &str, max_chars: usize) -> &str {
     if text.len() <= max_chars {
         text
     } else {
-        // Find a safe UTF-8 boundary
         let mut end = max_chars;
         while !text.is_char_boundary(end) && end > 0 {
             end -= 1;
@@ -342,10 +235,7 @@ fn truncate_for_context(text: &str, max_chars: usize) -> &str {
 }
 
 fn extract_content_for_range(_full_text: &str, page_range: Option<[u32; 2]>) -> String {
-    // For now, we don't have page-level text extraction, so return empty
-    // In a real implementation, this would use page markers or PDF structure
     if page_range.is_some() {
-        // Placeholder: would extract text for specific pages
         String::new()
     } else {
         String::new()
@@ -371,11 +261,11 @@ fn parse_llm_json<T: serde::de::DeserializeOwned>(response: &str) -> Result<T> {
         response.trim()
     };
 
-    // First try parsing as Value to validate JSON syntax
+    // First validate syntax
     let _: serde_json::Value = serde_json::from_str(json_str)
-        .context(format!("Invalid JSON syntax. First 300 chars: {}", &json_str.chars().take(300).collect::<String>()))?;
+        .context(format!("Invalid JSON syntax: {}", &json_str.chars().take(200).collect::<String>()))?;
     
-    // Then parse as the expected type
+    // Parse as expected type
     serde_json::from_str(json_str)
-        .context(format!("JSON structure mismatch. First 300 chars: {}", &json_str.chars().take(300).collect::<String>()))
+        .context(format!("JSON structure mismatch: {}", &json_str.chars().take(200).collect::<String>()))
 }
