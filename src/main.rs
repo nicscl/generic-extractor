@@ -5,6 +5,7 @@ mod content_store;
 mod extractor;
 mod openrouter;
 mod schema;
+mod supabase;
 
 use axum::{
     extract::{DefaultBodyLimit, Multipart, Path, Query, State},
@@ -36,6 +37,7 @@ struct AppState {
     openrouter: Arc<OpenRouterClient>,
     configs: Arc<ConfigStore>,
     http_client: reqwest::Client,
+    supabase: Option<supabase::SupabaseClient>,
 }
 
 #[tokio::main]
@@ -59,6 +61,18 @@ async fn main() -> anyhow::Result<()> {
     let openrouter = OpenRouterClient::from_env()?;
     info!("OpenRouter client initialized");
 
+    // Initialize Supabase client (optional)
+    let supabase = match supabase::SupabaseClient::from_env() {
+        Ok(client) => {
+            info!("Supabase client initialized");
+            Some(client)
+        }
+        Err(e) => {
+            info!("Supabase not configured: {} (upload=true will fail)", e);
+            None
+        }
+    };
+
     // Build application state
     let state = AppState {
         extractions: Arc::new(RwLock::new(HashMap::new())),
@@ -66,6 +80,7 @@ async fn main() -> anyhow::Result<()> {
         openrouter: Arc::new(openrouter),
         configs: Arc::new(configs),
         http_client: reqwest::Client::new(),
+        supabase,
     };
 
     // Build router
@@ -122,6 +137,7 @@ async fn get_config(
 #[derive(serde::Deserialize)]
 struct ExtractQuery {
     config: Option<String>,
+    upload: Option<bool>,
 }
 
 /// Upload a document and extract its structure using Docling + LLM.
@@ -200,10 +216,23 @@ async fn extract_document(
             (StatusCode::INTERNAL_SERVER_ERROR, format!("Extraction failed: {}", e))
         })?;
 
-    // Store extraction
+    // Store extraction in memory
     {
         let mut extractions = state.extractions.write().unwrap();
         extractions.insert(extraction.id.clone(), extraction.clone());
+    }
+
+    // Upload to Supabase if requested
+    if query.upload.unwrap_or(false) {
+        if let Some(ref supabase) = state.supabase {
+            supabase.upload_extraction(&extraction, &state.content_store).await.map_err(|e| {
+                error!("Supabase upload failed: {}", e);
+                (StatusCode::INTERNAL_SERVER_ERROR, format!("Supabase upload failed: {}", e))
+            })?;
+            info!("Uploaded extraction {} to Supabase", extraction.id);
+        } else {
+            return Err((StatusCode::BAD_REQUEST, "Supabase not configured. Set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY".to_string()));
+        }
     }
 
     info!("Extraction complete: {}", extraction.id);
