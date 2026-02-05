@@ -55,52 +55,53 @@ impl ConfigStore {
     /// Load all configs from the specified directory.
     pub fn load_from_dir(dir: &Path) -> Result<Self> {
         let mut configs = HashMap::new();
-        
+
         if !dir.exists() {
             anyhow::bail!("Config directory does not exist: {:?}", dir);
         }
-        
+
         for entry in std::fs::read_dir(dir)? {
             let entry = entry?;
             let path = entry.path();
-            
+
             if path.extension().map(|e| e == "json").unwrap_or(false) {
                 let content = std::fs::read_to_string(&path)
                     .with_context(|| format!("Failed to read config: {:?}", path))?;
-                    
+
                 let config: ExtractionConfig = serde_json::from_str(&content)
                     .with_context(|| format!("Failed to parse config: {:?}", path))?;
-                    
+
                 info!("Loaded config: {} from {:?}", config.name, path);
                 configs.insert(config.name.clone(), config);
             }
         }
-        
+
         if configs.is_empty() {
             anyhow::bail!("No configs found in {:?}", dir);
         }
-        
+
         // Use first config as default, or "default" if exists
-        let default_config = configs.get("default")
+        let default_config = configs
+            .get("default")
             .map(|c| c.name.clone())
             .unwrap_or_else(|| configs.keys().next().unwrap().clone());
-        
+
         Ok(Self {
             configs: Arc::new(configs),
             default_config,
         })
     }
-    
+
     /// Get a config by name.
     pub fn get(&self, name: &str) -> Option<&ExtractionConfig> {
         self.configs.get(name)
     }
-    
+
     /// Get the default config.
     pub fn default(&self) -> &ExtractionConfig {
         self.configs.get(&self.default_config).unwrap()
     }
-    
+
     /// List all available config names.
     pub fn list(&self) -> Vec<&str> {
         self.configs.keys().map(|s| s.as_str()).collect()

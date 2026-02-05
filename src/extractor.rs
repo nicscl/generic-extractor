@@ -4,8 +4,7 @@ use crate::config::ExtractionConfig;
 use crate::content_store::ContentStore;
 use crate::openrouter::{Message, OpenRouterClient};
 use crate::schema::{
-    ConfidenceScores, DocumentNode, EmbeddedReference, Extraction,
-    Relationship, StructureMapEntry,
+    ConfidenceScores, DocumentNode, EmbeddedReference, Extraction, Relationship, StructureMapEntry,
 };
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -53,7 +52,10 @@ impl Extractor {
     ) -> Result<Extraction> {
         info!(
             "Starting extraction for: {} ({} pages, {} chars) using config: {}",
-            filename, docling.total_pages, docling.markdown.len(), config.name
+            filename,
+            docling.total_pages,
+            docling.markdown.len(),
+            config.name
         );
 
         // Compute content hash from the markdown
@@ -72,7 +74,7 @@ impl Extractor {
             docling.total_pages,
             truncate_for_context(&docling.markdown, 150000) // ~150K chars max
         );
-        
+
         let user_prompt = r#"Based on the document above, extract its hierarchical structure as JSON. Return ONLY valid JSON with this structure:
 
 {
@@ -97,20 +99,17 @@ impl Extractor {
   ]
 }"#;
 
-        let messages = vec![
-            Message::system(system_prompt),
-            Message::user(user_prompt),
-        ];
+        let messages = vec![Message::system(system_prompt), Message::user(user_prompt)];
 
         // Call LLM for structure extraction
         debug!("Calling LLM for structure extraction (document cached in system prompt)");
         let response = self.client.chat(messages).await?;
-        
+
         debug!("Raw LLM response length: {} chars", response.len());
 
         // Parse the JSON response
-        let extracted: ExtractedStructure = parse_llm_json(&response)
-            .context("Failed to parse LLM structure response")?;
+        let extracted: ExtractedStructure =
+            parse_llm_json(&response).context("Failed to parse LLM structure response")?;
 
         // Build the Extraction object
         let mut extraction = Extraction::new(filename.to_string(), Some(config.name.clone()));
@@ -118,9 +117,10 @@ impl Extractor {
         extraction.total_pages = Some(docling.total_pages);
         extraction.summary = extracted.summary;
         extraction.structure_map = extracted.structure_map;
-        
+
         // Convert relationships
-        extraction.relationships = extracted.relationships
+        extraction.relationships = extracted
+            .relationships
             .into_iter()
             .map(|r| Relationship {
                 from: r.from,
@@ -129,7 +129,7 @@ impl Extractor {
                 citation: r.citation,
             })
             .collect();
-        
+
         // Store metadata as-is
         extraction.metadata = extracted.metadata.unwrap_or(serde_json::Value::Null);
 
@@ -178,11 +178,15 @@ impl Extractor {
                 date: node.date,
                 author: node.author,
                 summary: node.summary,
-                references: node.references.into_iter().map(|r| EmbeddedReference {
-                    node: r.node,
-                    ref_type: r.ref_type,
-                    citation: r.citation,
-                }).collect(),
+                references: node
+                    .references
+                    .into_iter()
+                    .map(|r| EmbeddedReference {
+                        node: r.node,
+                        ref_type: r.ref_type,
+                        citation: r.citation,
+                    })
+                    .collect(),
                 referenced_by: Vec::new(),
                 content_ref,
                 confidence: Some(ConfidenceScores {
@@ -265,7 +269,8 @@ struct ExtractedRelationship {
 
 /// Slice pages from Docling response for a given page range.
 fn slice_pages(pages: &[PageContent], range: [u32; 2]) -> String {
-    pages.iter()
+    pages
+        .iter()
         .filter(|p| p.page_num >= range[0] && p.page_num <= range[1])
         .map(|p| format!("--- Page {} ---\n{}", p.page_num, p.text))
         .collect::<Vec<_>>()
@@ -294,20 +299,20 @@ fn parse_llm_json<T: serde::de::DeserializeOwned>(response: &str) -> Result<T> {
             .unwrap_or(response)
             .trim()
     } else if response.contains("```") {
-        response
-            .split("```")
-            .nth(1)
-            .unwrap_or(response)
-            .trim()
+        response.split("```").nth(1).unwrap_or(response).trim()
     } else {
         response.trim()
     };
 
     // First validate syntax
-    let _: serde_json::Value = serde_json::from_str(json_str)
-        .context(format!("Invalid JSON syntax: {}", &json_str.chars().take(200).collect::<String>()))?;
-    
+    let _: serde_json::Value = serde_json::from_str(json_str).context(format!(
+        "Invalid JSON syntax: {}",
+        &json_str.chars().take(200).collect::<String>()
+    ))?;
+
     // Parse as expected type
-    serde_json::from_str(json_str)
-        .context(format!("JSON structure mismatch: {}", &json_str.chars().take(200).collect::<String>()))
+    serde_json::from_str(json_str).context(format!(
+        "JSON structure mismatch: {}",
+        &json_str.chars().take(200).collect::<String>()
+    ))
 }

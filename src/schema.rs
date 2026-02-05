@@ -18,10 +18,10 @@ pub fn now_iso8601() -> String {
     let hours = time_of_day / 3600;
     let minutes = (time_of_day % 3600) / 60;
     let seconds = time_of_day % 60;
-    
+
     let mut year = 1970i32;
     let mut remaining_days = days_since_epoch as i32;
-    
+
     loop {
         let days_in_year = if is_leap_year(year) { 366 } else { 365 };
         if remaining_days < days_in_year {
@@ -30,13 +30,13 @@ pub fn now_iso8601() -> String {
         remaining_days -= days_in_year;
         year += 1;
     }
-    
+
     let days_in_months: [i32; 12] = if is_leap_year(year) {
         [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
     } else {
         [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
     };
-    
+
     let mut month = 1;
     for days in days_in_months {
         if remaining_days < days {
@@ -46,7 +46,7 @@ pub fn now_iso8601() -> String {
         month += 1;
     }
     let day = remaining_days + 1;
-    
+
     format!(
         "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
         year, month, day, hours, minutes, seconds
@@ -123,7 +123,7 @@ pub struct Relationship {
     pub from: String,
     pub to: String,
     #[serde(rename = "type")]
-    pub rel_type: String,  // Now a string, validated against config
+    pub rel_type: String, // Now a string, validated against config
     #[serde(skip_serializing_if = "Option::is_none")]
     pub citation: Option<String>,
 }
@@ -133,7 +133,7 @@ pub struct Relationship {
 pub struct DocumentNode {
     pub id: String,
     #[serde(rename = "type")]
-    pub node_type: String,  // Now a string, validated against config
+    pub node_type: String, // Now a string, validated against config
     #[serde(skip_serializing_if = "Option::is_none")]
     pub subtype: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

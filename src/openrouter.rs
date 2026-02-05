@@ -2,7 +2,7 @@
 //! OpenRouter API client for LLM interactions.
 
 use anyhow::{Context, Result};
-use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::env;
@@ -24,7 +24,7 @@ impl OpenRouterClient {
     pub fn from_env() -> Result<Self> {
         let api_key = env::var("OPENROUTER_API_KEY")
             .context("OPENROUTER_API_KEY environment variable not set")?;
-        
+
         Ok(Self {
             client: Client::new(),
             api_key,
@@ -80,8 +80,8 @@ impl OpenRouterClient {
         };
 
         let response = self.send_request(request).await?;
-        let parsed: T = serde_json::from_str(&response)
-            .context("Failed to parse LLM response as JSON")?;
+        let parsed: T =
+            serde_json::from_str(&response).context("Failed to parse LLM response as JSON")?;
         Ok(parsed)
     }
 

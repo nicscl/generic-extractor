@@ -5,7 +5,7 @@ use reqwest::Client;
 use serde_json::json;
 use tracing::{debug, info};
 
-use crate::schema::{Extraction, DocumentNode, Relationship};
+use crate::schema::{DocumentNode, Extraction, Relationship};
 
 /// Supabase client configuration.
 #[derive(Clone)]
@@ -18,18 +18,18 @@ pub struct SupabaseClient {
 impl SupabaseClient {
     /// Create a new Supabase client from environment variables.
     pub fn from_env() -> Result<Self> {
-        let base_url = std::env::var("SUPABASE_URL")
-            .map_err(|_| anyhow!("SUPABASE_URL not set"))?;
+        let base_url =
+            std::env::var("SUPABASE_URL").map_err(|_| anyhow!("SUPABASE_URL not set"))?;
         let service_role_key = std::env::var("SUPABASE_SERVICE_ROLE_KEY")
             .map_err(|_| anyhow!("SUPABASE_SERVICE_ROLE_KEY not set"))?;
-        
+
         Ok(Self {
             client: Client::new(),
             base_url,
             service_role_key,
         })
     }
-    
+
     /// Upload an extraction to Supabase.
     pub async fn upload_extraction(
         &self,
@@ -37,24 +37,29 @@ impl SupabaseClient {
         content_store: &crate::content_store::ContentStore,
     ) -> Result<()> {
         info!("Uploading extraction {} to Supabase", extraction.id);
-        
+
         // 1. Insert main extraction record
         self.insert_extraction(extraction).await?;
-        
+
         // 2. Insert nodes (flattened) and content
-        self.insert_nodes(&extraction.id, &extraction.children, None, content_store).await?;
-        
+        self.insert_nodes(&extraction.id, &extraction.children, None, content_store)
+            .await?;
+
         // 3. Insert relationships
-        self.insert_relationships(&extraction.id, &extraction.relationships).await?;
-        
-        info!("Successfully uploaded extraction {} to Supabase", extraction.id);
+        self.insert_relationships(&extraction.id, &extraction.relationships)
+            .await?;
+
+        info!(
+            "Successfully uploaded extraction {} to Supabase",
+            extraction.id
+        );
         Ok(())
     }
-    
+
     /// Insert the main extraction record.
     async fn insert_extraction(&self, extraction: &Extraction) -> Result<()> {
         let url = format!("{}/rest/v1/extractions", self.base_url);
-        
+
         let body = json!({
             "id": extraction.id,
             "config_name": extraction.config_name,
@@ -67,10 +72,11 @@ impl SupabaseClient {
             "extracted_at": extraction.extracted_at,
             "extractor_version": extraction.extractor_version,
         });
-        
+
         debug!("Inserting extraction: {}", extraction.id);
-        
-        let resp = self.client
+
+        let resp = self
+            .client
             .post(&url)
             .header("apikey", &self.service_role_key)
             .header("Authorization", format!("Bearer {}", self.service_role_key))
@@ -80,16 +86,20 @@ impl SupabaseClient {
             .json(&body)
             .send()
             .await?;
-        
+
         if !resp.status().is_success() {
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
-            return Err(anyhow!("Failed to insert extraction: {} - {}", status, text));
+            return Err(anyhow!(
+                "Failed to insert extraction: {} - {}",
+                status,
+                text
+            ));
         }
-        
+
         Ok(())
     }
-    
+
     /// Recursively insert nodes and their content.
     async fn insert_nodes(
         &self,
@@ -101,23 +111,30 @@ impl SupabaseClient {
         for node in nodes {
             // Insert node
             self.insert_node(extraction_id, node, parent_id).await?;
-            
+
             // Insert content if available
             if let Some(content_ref) = &node.content_ref {
                 if let Some(chunk) = content_store.get(content_ref, 0, usize::MAX) {
-                    self.insert_content(extraction_id, &node.id, &chunk.content).await?;
+                    self.insert_content(extraction_id, &node.id, &chunk.content)
+                        .await?;
                 }
             }
-            
+
             // Recursively insert children
             if !node.children.is_empty() {
-                Box::pin(self.insert_nodes(extraction_id, &node.children, Some(&node.id), content_store)).await?;
+                Box::pin(self.insert_nodes(
+                    extraction_id,
+                    &node.children,
+                    Some(&node.id),
+                    content_store,
+                ))
+                .await?;
             }
         }
-        
+
         Ok(())
     }
-    
+
     /// Insert a single node.
     async fn insert_node(
         &self,
@@ -126,11 +143,12 @@ impl SupabaseClient {
         parent_id: Option<&str>,
     ) -> Result<()> {
         let url = format!("{}/rest/v1/extraction_nodes", self.base_url);
-        
-        let (page_start, page_end) = node.page_range
+
+        let (page_start, page_end) = node
+            .page_range
             .map(|arr| (Some(arr[0]), Some(arr[1])))
             .unwrap_or((None, None));
-        
+
         let body = json!({
             "id": node.id,
             "extraction_id": extraction_id,
@@ -145,8 +163,9 @@ impl SupabaseClient {
             "summary": node.summary,
             "confidence": node.confidence,
         });
-        
-        let resp = self.client
+
+        let resp = self
+            .client
             .post(&url)
             .header("apikey", &self.service_role_key)
             .header("Authorization", format!("Bearer {}", self.service_role_key))
@@ -156,17 +175,22 @@ impl SupabaseClient {
             .json(&body)
             .send()
             .await?;
-        
+
         if !resp.status().is_success() {
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
-            return Err(anyhow!("Failed to insert node {}: {} - {}", node.id, status, text));
+            return Err(anyhow!(
+                "Failed to insert node {}: {} - {}",
+                node.id,
+                status,
+                text
+            ));
         }
-        
+
         debug!("Inserted node: {}", node.id);
         Ok(())
     }
-    
+
     /// Insert node content.
     async fn insert_content(
         &self,
@@ -175,15 +199,16 @@ impl SupabaseClient {
         content: &str,
     ) -> Result<()> {
         let url = format!("{}/rest/v1/node_content", self.base_url);
-        
+
         let body = json!({
             "extraction_id": extraction_id,
             "node_id": node_id,
             "content": content,
             "char_count": content.len(),
         });
-        
-        let resp = self.client
+
+        let resp = self
+            .client
             .post(&url)
             .header("apikey", &self.service_role_key)
             .header("Authorization", format!("Bearer {}", self.service_role_key))
@@ -193,17 +218,26 @@ impl SupabaseClient {
             .json(&body)
             .send()
             .await?;
-        
+
         if !resp.status().is_success() {
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
-            return Err(anyhow!("Failed to insert content for {}: {} - {}", node_id, status, text));
+            return Err(anyhow!(
+                "Failed to insert content for {}: {} - {}",
+                node_id,
+                status,
+                text
+            ));
         }
-        
-        debug!("Inserted content for node: {} ({} chars)", node_id, content.len());
+
+        debug!(
+            "Inserted content for node: {} ({} chars)",
+            node_id,
+            content.len()
+        );
         Ok(())
     }
-    
+
     /// Insert relationships.
     async fn insert_relationships(
         &self,
@@ -213,17 +247,23 @@ impl SupabaseClient {
         if relationships.is_empty() {
             return Ok(());
         }
-        
+
         let url = format!("{}/rest/v1/extraction_relationships", self.base_url);
-        
-        let bodies: Vec<_> = relationships.iter().map(|r| json!({
-            "extraction_id": extraction_id,
-            "from_node": r.from,
-            "to_node": r.to,
-            "relationship_type": r.rel_type,
-        })).collect();
-        
-        let resp = self.client
+
+        let bodies: Vec<_> = relationships
+            .iter()
+            .map(|r| {
+                json!({
+                    "extraction_id": extraction_id,
+                    "from_node": r.from,
+                    "to_node": r.to,
+                    "relationship_type": r.rel_type,
+                })
+            })
+            .collect();
+
+        let resp = self
+            .client
             .post(&url)
             .header("apikey", &self.service_role_key)
             .header("Authorization", format!("Bearer {}", self.service_role_key))
@@ -233,13 +273,17 @@ impl SupabaseClient {
             .json(&bodies)
             .send()
             .await?;
-        
+
         if !resp.status().is_success() {
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
-            return Err(anyhow!("Failed to insert relationships: {} - {}", status, text));
+            return Err(anyhow!(
+                "Failed to insert relationships: {} - {}",
+                status,
+                text
+            ));
         }
-        
+
         debug!("Inserted {} relationships", relationships.len());
         Ok(())
     }

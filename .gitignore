@@ -10,3 +10,5 @@ Cargo.lock
 __pycache__/
 *.pyc
 docling-sidecar/.venv/
+docling-sidecar/*.egg-info/
+docling-sidecar/uv.lock

@@ -47,15 +47,21 @@ async fn main() -> anyhow::Result<()> {
 
     // Initialize tracing
     tracing_subscriber::registry()
-        .with(tracing_subscriber::EnvFilter::try_from_default_env()
-            .unwrap_or_else(|_| "generic_extractor=debug,tower_http=debug".into()))
+        .with(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "generic_extractor=debug,tower_http=debug".into()),
+        )
         .with(tracing_subscriber::fmt::layer())
         .init();
 
     // Load configs from filesystem
     let config_dir = std::path::Path::new("configs");
     let configs = ConfigStore::load_from_dir(config_dir)?;
-    info!("Loaded {} configs: {:?}", configs.list().len(), configs.list());
+    info!(
+        "Loaded {} configs: {:?}",
+        configs.list().len(),
+        configs.list()
+    );
 
     // Initialize OpenRouter client
     let openrouter = OpenRouterClient::from_env()?;
@@ -89,6 +95,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/configs", get(list_configs))
         .route("/configs/:name", get(get_config))
         .route("/extract", post(extract_document))
+        .route("/extractions/:id/snapshot", get(get_extraction_snapshot))
         .route("/extractions/:id", get(get_extraction))
         .route("/extractions/:id/node/:node_id", get(get_node))
         .route("/content/:ref_path", get(get_content))
@@ -116,9 +123,7 @@ async fn health() -> &'static str {
 }
 
 /// List available configs.
-async fn list_configs(
-    State(state): State<AppState>,
-) -> Json<Vec<String>> {
+async fn list_configs(State(state): State<AppState>) -> Json<Vec<String>> {
     Json(state.configs.list().iter().map(|s| s.to_string()).collect())
 }
 
@@ -127,7 +132,8 @@ async fn get_config(
     State(state): State<AppState>,
     Path(name): Path<String>,
 ) -> Result<Json<config::ExtractionConfig>, StatusCode> {
-    state.configs
+    state
+        .configs
         .get(&name)
         .cloned()
         .map(Json)
@@ -149,21 +155,37 @@ async fn extract_document(
     // Get the config
     let config_name = query.config.as_deref().unwrap_or("legal_br");
     let config = state.configs.get(config_name).ok_or_else(|| {
-        (StatusCode::BAD_REQUEST, format!("Unknown config: {}. Available: {:?}", config_name, state.configs.list()))
+        (
+            StatusCode::BAD_REQUEST,
+            format!(
+                "Unknown config: {}. Available: {:?}",
+                config_name,
+                state.configs.list()
+            ),
+        )
     })?;
 
     // Read the uploaded file
     let mut filename = String::new();
     let mut file_data = Vec::new();
 
-    while let Some(field) = multipart.next_field().await.map_err(|e| {
-        (StatusCode::BAD_REQUEST, format!("Multipart error: {}", e))
-    })? {
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("Multipart error: {}", e)))?
+    {
         if field.name() == Some("file") {
             filename = field.file_name().unwrap_or("document").to_string();
-            file_data = field.bytes().await.map_err(|e| {
-                (StatusCode::BAD_REQUEST, format!("Failed to read file: {}", e))
-            })?.to_vec();
+            file_data = field
+                .bytes()
+                .await
+                .map_err(|e| {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        format!("Failed to read file: {}", e),
+                    )
+                })?
+                .to_vec();
             break;
         }
     }
@@ -172,14 +194,22 @@ async fn extract_document(
         return Err((StatusCode::BAD_REQUEST, "No file uploaded".to_string()));
     }
 
-    info!("Received file: {} ({} bytes) with config: {}", filename, file_data.len(), config_name);
+    info!(
+        "Received file: {} ({} bytes) with config: {}",
+        filename,
+        file_data.len(),
+        config_name
+    );
 
     // Step 1: Call Docling sidecar for OCR + structure
     let docling_response = call_docling_sidecar(&state.http_client, &filename, &file_data)
         .await
         .map_err(|e| {
             error!("Docling conversion failed: {}", e);
-            (StatusCode::INTERNAL_SERVER_ERROR, format!("Docling conversion failed: {}", e))
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Docling conversion failed: {}", e),
+            )
         })?;
 
     info!(
@@ -187,14 +217,14 @@ async fn extract_document(
         docling_response.total_pages,
         docling_response.markdown.len()
     );
-    
+
     // Debug: check pages content
-    let non_empty_pages = docling_response.pages.iter()
+    let non_empty_pages = docling_response
+        .pages
+        .iter()
         .filter(|p| !p.text.is_empty())
         .count();
-    let total_page_chars: usize = docling_response.pages.iter()
-        .map(|p| p.text.len())
-        .sum();
+    let total_page_chars: usize = docling_response.pages.iter().map(|p| p.text.len()).sum();
     debug!(
         "Pages array: {} items, {} non-empty, {} total chars",
         docling_response.pages.len(),
@@ -203,17 +233,17 @@ async fn extract_document(
     );
 
     // Step 2: Run LLM extraction with docling output
-    let extractor = Extractor::new(
-        (*state.openrouter).clone(),
-        state.content_store.clone(),
-    );
+    let extractor = Extractor::new((*state.openrouter).clone(), state.content_store.clone());
 
     let extraction = extractor
         .extract(&filename, &docling_response, config)
         .await
         .map_err(|e| {
             error!("Extraction failed: {}", e);
-            (StatusCode::INTERNAL_SERVER_ERROR, format!("Extraction failed: {}", e))
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Extraction failed: {}", e),
+            )
         })?;
 
     // Store extraction in memory
@@ -225,13 +255,23 @@ async fn extract_document(
     // Upload to Supabase if requested
     if query.upload.unwrap_or(false) {
         if let Some(ref supabase) = state.supabase {
-            supabase.upload_extraction(&extraction, &state.content_store).await.map_err(|e| {
-                error!("Supabase upload failed: {}", e);
-                (StatusCode::INTERNAL_SERVER_ERROR, format!("Supabase upload failed: {}", e))
-            })?;
+            supabase
+                .upload_extraction(&extraction, &state.content_store)
+                .await
+                .map_err(|e| {
+                    error!("Supabase upload failed: {}", e);
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("Supabase upload failed: {}", e),
+                    )
+                })?;
             info!("Uploaded extraction {} to Supabase", extraction.id);
         } else {
-            return Err((StatusCode::BAD_REQUEST, "Supabase not configured. Set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY".to_string()));
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "Supabase not configured. Set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY"
+                    .to_string(),
+            ));
         }
     }
 
@@ -282,6 +322,59 @@ async fn get_extraction(
         .ok_or(StatusCode::NOT_FOUND)
 }
 
+#[derive(serde::Deserialize)]
+struct SnapshotQuery {
+    include_content_meta: Option<bool>,
+}
+
+#[derive(serde::Serialize)]
+struct ExtractionSnapshot {
+    #[serde(flatten)]
+    extraction: Extraction,
+    content_blobs_included: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    content_index: Vec<NodeContentMeta>,
+}
+
+#[derive(serde::Serialize)]
+struct NodeContentMeta {
+    node_id: String,
+    content_ref: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    char_count: Option<usize>,
+    available: bool,
+}
+
+/// Get a full extraction snapshot optimized for MCP/context loading.
+///
+/// Returns the entire extraction tree in a single call and never includes raw
+/// content text. Use `/content/:ref_path` to lazy-load content when needed.
+async fn get_extraction_snapshot(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(query): Query<SnapshotQuery>,
+) -> Result<Json<ExtractionSnapshot>, StatusCode> {
+    let extraction = {
+        let extractions = state.extractions.read().unwrap();
+        extractions.get(&id).cloned().ok_or(StatusCode::NOT_FOUND)?
+    };
+
+    let include_content_meta = query.include_content_meta.unwrap_or(true);
+    let content_index = if include_content_meta {
+        let mut index = Vec::new();
+        collect_content_meta(&extraction.children, &state.content_store, &mut index);
+        index
+    } else {
+        Vec::new()
+    };
+
+    Ok(Json(ExtractionSnapshot {
+        extraction,
+        content_blobs_included: false,
+        content_index,
+    }))
+}
+
 /// Get a specific node from an extraction.
 async fn get_node(
     State(state): State<AppState>,
@@ -312,8 +405,12 @@ async fn get_content(
     let offset = query.offset.unwrap_or(0);
     let limit = query.limit.unwrap_or(4000);
 
-    info!("get_content: ref_path='{}', content_ref='{}', exists={}", 
-           ref_path, content_ref, state.content_store.exists(&content_ref));
+    info!(
+        "get_content: ref_path='{}', content_ref='{}', exists={}",
+        ref_path,
+        content_ref,
+        state.content_store.exists(&content_ref)
+    );
 
     state
         .content_store
@@ -340,4 +437,27 @@ fn find_node<'a>(
         }
     }
     None
+}
+
+/// Recursively collect content metadata for all nodes.
+fn collect_content_meta(
+    nodes: &[schema::DocumentNode],
+    content_store: &ContentStore,
+    out: &mut Vec<NodeContentMeta>,
+) {
+    for node in nodes {
+        if let Some(content_ref) = &node.content_ref {
+            let char_count = content_store.len(content_ref);
+            out.push(NodeContentMeta {
+                node_id: node.id.clone(),
+                content_ref: content_ref.clone(),
+                char_count,
+                available: char_count.is_some(),
+            });
+        }
+
+        if !node.children.is_empty() {
+            collect_content_meta(&node.children, content_store, out);
+        }
+    }
 }

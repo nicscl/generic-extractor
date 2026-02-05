@@ -15,7 +15,7 @@ pub struct ContentChunk {
 }
 
 /// In-memory content store.
-/// 
+///
 /// Stores full text content and serves it with pagination support.
 /// Content refs have format: `content://{node_id}`
 #[derive(Debug, Clone, Default)]
@@ -39,7 +39,7 @@ impl ContentStore {
     }
 
     /// Retrieve content with pagination.
-    /// 
+    ///
     /// - `content_ref`: The content reference (e.g., `content://node_id`)
     /// - `offset`: Character offset to start from
     /// - `limit`: Maximum characters to return
@@ -49,7 +49,7 @@ impl ContentStore {
         let content = store.get(node_id)?;
 
         let total_chars = content.chars().count();
-        
+
         if offset >= total_chars {
             return Some(ContentChunk {
                 content: String::new(),
@@ -108,10 +108,10 @@ mod tests {
     fn test_store_and_retrieve() {
         let store = ContentStore::new();
         let content = "Hello, world! This is test content.".to_string();
-        
+
         let ref_uri = store.store("test_node", content.clone());
         assert_eq!(ref_uri, "content://test_node");
-        
+
         let full = store.get_full(&ref_uri).unwrap();
         assert_eq!(full, content);
     }
