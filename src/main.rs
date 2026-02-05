@@ -15,15 +15,18 @@ use axum::{
 };
 use config::ConfigStore;
 use content_store::{ContentChunk, ContentStore};
-use extractor::Extractor;
+use extractor::{DoclingResponse, Extractor};
 use openrouter::OpenRouterClient;
 use schema::Extraction;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
-use tracing::{error, info};
+use tracing::{debug, error, info};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+
+/// Docling sidecar URL (runs on port 3001)
+const DOCLING_SIDECAR_URL: &str = "http://localhost:3001";
 
 /// Application state shared across handlers.
 #[derive(Clone)]
@@ -32,6 +35,7 @@ struct AppState {
     content_store: ContentStore,
     openrouter: Arc<OpenRouterClient>,
     configs: Arc<ConfigStore>,
+    http_client: reqwest::Client,
 }
 
 #[tokio::main]
@@ -61,17 +65,18 @@ async fn main() -> anyhow::Result<()> {
         content_store: ContentStore::new(),
         openrouter: Arc::new(openrouter),
         configs: Arc::new(configs),
+        http_client: reqwest::Client::new(),
     };
 
     // Build router
     let app = Router::new()
         .route("/health", get(health))
         .route("/configs", get(list_configs))
-        .route("/configs/{name}", get(get_config))
+        .route("/configs/:name", get(get_config))
         .route("/extract", post(extract_document))
-        .route("/extractions/{id}", get(get_extraction))
-        .route("/extractions/{id}/node/{node_id}", get(get_node))
-        .route("/content/{ref}", get(get_content))
+        .route("/extractions/:id", get(get_extraction))
+        .route("/extractions/:id/node/:node_id", get(get_node))
+        .route("/content/:ref_path", get(get_content))
         .layer(DefaultBodyLimit::max(100 * 1024 * 1024)) // 100MB
         .layer(TraceLayer::new_for_http())
         .layer(CorsLayer::permissive())
@@ -80,6 +85,7 @@ async fn main() -> anyhow::Result<()> {
     // Run server
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await?;
     info!("Server listening on http://0.0.0.0:3000");
+    info!("Docling sidecar expected at {}", DOCLING_SIDECAR_URL);
     axum::serve(listener, app).await?;
 
     Ok(())
@@ -118,7 +124,7 @@ struct ExtractQuery {
     config: Option<String>,
 }
 
-/// Upload a document and extract its structure.
+/// Upload a document and extract its structure using Docling + LLM.
 async fn extract_document(
     State(state): State<AppState>,
     Query(query): Query<ExtractQuery>,
@@ -152,31 +158,42 @@ async fn extract_document(
 
     info!("Received file: {} ({} bytes) with config: {}", filename, file_data.len(), config_name);
 
-    // Extract text from PDF
-    let text_content = if filename.to_lowercase().ends_with(".pdf") {
-        extract_pdf_text(&file_data).unwrap_or_else(|e| {
-            error!("PDF extraction failed: {}", e);
-            String::new()
-        })
-    } else {
-        String::from_utf8_lossy(&file_data).to_string()
-    };
+    // Step 1: Call Docling sidecar for OCR + structure
+    let docling_response = call_docling_sidecar(&state.http_client, &filename, &file_data)
+        .await
+        .map_err(|e| {
+            error!("Docling conversion failed: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, format!("Docling conversion failed: {}", e))
+        })?;
 
-    if text_content.is_empty() {
-        return Err((
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "Could not extract text from document".to_string(),
-        ));
-    }
+    info!(
+        "Docling extracted {} pages, {} chars markdown",
+        docling_response.total_pages,
+        docling_response.markdown.len()
+    );
+    
+    // Debug: check pages content
+    let non_empty_pages = docling_response.pages.iter()
+        .filter(|p| !p.text.is_empty())
+        .count();
+    let total_page_chars: usize = docling_response.pages.iter()
+        .map(|p| p.text.len())
+        .sum();
+    debug!(
+        "Pages array: {} items, {} non-empty, {} total chars",
+        docling_response.pages.len(),
+        non_empty_pages,
+        total_page_chars
+    );
 
-    // Run extraction with config
+    // Step 2: Run LLM extraction with docling output
     let extractor = Extractor::new(
         (*state.openrouter).clone(),
         state.content_store.clone(),
     );
 
     let extraction = extractor
-        .extract(&filename, &text_content, None, config)
+        .extract(&filename, &docling_response, config)
         .await
         .map_err(|e| {
             error!("Extraction failed: {}", e);
@@ -191,6 +208,36 @@ async fn extract_document(
 
     info!("Extraction complete: {}", extraction.id);
     Ok(Json(extraction))
+}
+
+/// Call the Docling sidecar to convert a PDF.
+async fn call_docling_sidecar(
+    client: &reqwest::Client,
+    filename: &str,
+    file_data: &[u8],
+) -> anyhow::Result<DoclingResponse> {
+    use reqwest::multipart::{Form, Part};
+
+    let part = Part::bytes(file_data.to_vec())
+        .file_name(filename.to_string())
+        .mime_str("application/pdf")?;
+
+    let form = Form::new().part("file", part);
+
+    let response = client
+        .post(format!("{}/convert", DOCLING_SIDECAR_URL))
+        .multipart(form)
+        .send()
+        .await?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let error_text = response.text().await.unwrap_or_default();
+        anyhow::bail!("Docling sidecar error ({}): {}", status, error_text);
+    }
+
+    let docling: DoclingResponse = response.json().await?;
+    Ok(docling)
 }
 
 /// Get an extraction by ID.
@@ -236,6 +283,9 @@ async fn get_content(
     let offset = query.offset.unwrap_or(0);
     let limit = query.limit.unwrap_or(4000);
 
+    info!("get_content: ref_path='{}', content_ref='{}', exists={}", 
+           ref_path, content_ref, state.content_store.exists(&content_ref));
+
     state
         .content_store
         .get(&content_ref, offset, limit)
@@ -246,27 +296,6 @@ async fn get_content(
 // ============================================================================
 // Helper functions
 // ============================================================================
-
-/// Extract text from a PDF file using lopdf.
-fn extract_pdf_text(data: &[u8]) -> anyhow::Result<String> {
-    use lopdf::Document;
-    use std::io::Cursor;
-    
-    let doc = Document::load_from(Cursor::new(data))
-        .map_err(|e| anyhow::anyhow!("Failed to load PDF: {}", e))?;
-    
-    let mut text = String::new();
-    let pages = doc.get_pages();
-    
-    for (page_num, _) in pages {
-        if let Ok(content) = doc.extract_text(&[page_num]) {
-            text.push_str(&content);
-            text.push('\n');
-        }
-    }
-    
-    Ok(text)
-}
 
 /// Recursively find a node by ID.
 fn find_node<'a>(

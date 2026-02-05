@@ -31,8 +31,10 @@ impl ContentStore {
     /// Store content for a node, returns the content ref.
     pub fn store(&self, node_id: &str, content: String) -> String {
         let content_ref = format!("content://{}", node_id);
+        let content_len = content.len();
         let mut store = self.inner.write().unwrap();
         store.insert(node_id.to_string(), content);
+        tracing::debug!("ContentStore: stored '{}' ({} chars)", node_id, content_len);
         content_ref
     }
 

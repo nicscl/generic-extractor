@@ -45,6 +45,11 @@ impl OpenRouterClient {
             messages,
             max_tokens: Some(16384),
             response_format: None,
+            // Lock to Google for cache consistency
+            provider: Some(ProviderRouting {
+                only: Some(vec!["Google".to_string()]),
+                allow_fallbacks: Some(false),
+            }),
         };
 
         self.send_request(request).await
@@ -66,6 +71,11 @@ impl OpenRouterClient {
                     name: schema_name.to_string(),
                     schema,
                 },
+            }),
+            // Lock to Google for cache consistency
+            provider: Some(ProviderRouting {
+                only: Some(vec!["Google".to_string()]),
+                allow_fallbacks: Some(false),
             }),
         };
 
@@ -129,6 +139,20 @@ struct ChatCompletionRequest {
     max_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     response_format: Option<ResponseFormat>,
+    /// Provider routing for cache consistency
+    #[serde(skip_serializing_if = "Option::is_none")]
+    provider: Option<ProviderRouting>,
+}
+
+/// Provider routing options for cache consistency.
+#[derive(Debug, Serialize)]
+struct ProviderRouting {
+    /// Only use these providers (for cache hits)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    only: Option<Vec<String>>,
+    /// Don't fallback to other providers
+    #[serde(skip_serializing_if = "Option::is_none")]
+    allow_fallbacks: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]

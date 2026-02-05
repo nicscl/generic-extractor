@@ -1,4 +1,4 @@
-//! Document extraction pipeline using LLM.
+//! Document extraction pipeline using LLM with Docling OCR.
 
 use crate::config::ExtractionConfig;
 use crate::content_store::ContentStore;
@@ -8,8 +8,26 @@ use crate::schema::{
     Relationship, StructureMapEntry,
 };
 use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tracing::{debug, info};
+
+/// Page-level OCR content from Docling.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PageContent {
+    pub page_num: u32,
+    pub text: String,
+}
+
+/// Response from Docling sidecar.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DoclingResponse {
+    pub markdown: String,
+    pub pages: Vec<PageContent>,
+    pub total_pages: u32,
+    #[serde(default)]
+    pub metadata: serde_json::Value,
+}
 
 /// Extraction pipeline orchestrator.
 pub struct Extractor {
@@ -25,47 +43,67 @@ impl Extractor {
         }
     }
 
-    /// Extract structure from a document using the specified config.
+    /// Extract structure from a document using Docling OCR and LLM.
+    /// Uses token-cache-friendly prompt structure: document in system, instructions in user.
     pub async fn extract(
         &self,
         filename: &str,
-        text_content: &str,
-        images: Option<Vec<Vec<u8>>>,
+        docling: &DoclingResponse,
         config: &ExtractionConfig,
     ) -> Result<Extraction> {
-        info!("Starting extraction for: {} using config: {}", filename, config.name);
+        info!(
+            "Starting extraction for: {} ({} pages, {} chars) using config: {}",
+            filename, docling.total_pages, docling.markdown.len(), config.name
+        );
 
-        // Compute content hash
+        // Compute content hash from the markdown
         let content_hash = {
             let mut hasher = Sha256::new();
-            hasher.update(text_content.as_bytes());
+            hasher.update(docling.markdown.as_bytes());
             format!("{:x}", hasher.finalize())
         };
 
-        // Build messages using config prompt
-        let messages = if let Some(image_data) = images {
-            vec![
-                Message::system(&config.prompts.structure),
-                Message::user_with_images(
-                    format!(
-                        "Analyze this document:\n\n{}",
-                        truncate_for_context(text_content, 50000)
-                    ),
-                    image_data,
-                ),
-            ]
-        } else {
-            vec![
-                Message::system(&config.prompts.structure),
-                Message::user(format!(
-                    "Analyze this document:\n\n{}",
-                    truncate_for_context(text_content, 100000)
-                )),
-            ]
-        };
+        // Build token-cache-friendly messages:
+        // - System message contains config prompt + full document (CACHED PREFIX)
+        // - User message contains extraction instructions (VARIABLE SUFFIX)
+        let system_prompt = format!(
+            "{}\n\n--- DOCUMENT START (pages 1-{}) ---\n\n{}\n\n--- DOCUMENT END ---",
+            config.prompts.structure,
+            docling.total_pages,
+            truncate_for_context(&docling.markdown, 150000) // ~150K chars max
+        );
+        
+        let user_prompt = r#"Based on the document above, extract its hierarchical structure as JSON. Return ONLY valid JSON with this structure:
+
+{
+  "summary": "2-4 sentence overview",
+  "structure_map": [{"id": "...", "label": "...", "children": ["id1", "id2"]}],
+  "metadata": {...},
+  "children": [
+    {
+      "id": "unique_id",
+      "type": "DOCUMENT|PETICAO|DECISAO|RECURSO|SECTION|GROUP",
+      "subtype": "Specific type if applicable",
+      "label": "Human readable label",
+      "page_range": [start_page, end_page],
+      "date": "YYYY-MM-DD if known",
+      "author": "Author name if known",
+      "summary": "2-4 sentence summary",
+      "children": []
+    }
+  ],
+  "relationships": [
+    {"from": "id1", "to": "id2", "type": "references|responds_to|decides_on|appeals"}
+  ]
+}"#;
+
+        let messages = vec![
+            Message::system(system_prompt),
+            Message::user(user_prompt),
+        ];
 
         // Call LLM for structure extraction
-        debug!("Calling LLM for structure extraction");
+        debug!("Calling LLM for structure extraction (document cached in system prompt)");
         let response = self.client.chat(messages).await?;
         
         debug!("Raw LLM response length: {} chars", response.len());
@@ -77,6 +115,7 @@ impl Extractor {
         // Build the Extraction object
         let mut extraction = Extraction::new(filename.to_string(), Some(config.name.clone()));
         extraction.content_hash = Some(content_hash);
+        extraction.total_pages = Some(docling.total_pages);
         extraction.summary = extracted.summary;
         extraction.structure_map = extracted.structure_map;
         
@@ -91,11 +130,11 @@ impl Extractor {
             })
             .collect();
         
-        // Store metadata as-is (dynamic JSON)
+        // Store metadata as-is
         extraction.metadata = extracted.metadata.unwrap_or(serde_json::Value::Null);
 
-        // Process children and store content
-        extraction.children = self.process_children(extracted.children, text_content)?;
+        // Process children and populate content_ref with page-sliced OCR
+        extraction.children = self.process_children(extracted.children, &docling.pages)?;
 
         info!(
             "Extraction complete: {} top-level nodes, {} relationships",
@@ -106,17 +145,18 @@ impl Extractor {
         Ok(extraction)
     }
 
-    /// Process extracted children, storing content and computing refs.
+    /// Process extracted children, storing sliced page content.
     fn process_children(
         &self,
         nodes: Vec<ExtractedNode>,
-        full_text: &str,
+        pages: &[PageContent],
     ) -> Result<Vec<DocumentNode>> {
         let mut result = Vec::new();
 
         for node in nodes {
-            let content_ref = if !node.id.is_empty() {
-                let content = extract_content_for_range(full_text, node.page_range);
+            // Extract content for this node's page range from Docling OCR
+            let content_ref = if let Some(range) = node.page_range {
+                let content = slice_pages(pages, range);
                 if !content.is_empty() {
                     Some(self.content_store.store(&node.id, content))
                 } else {
@@ -126,7 +166,8 @@ impl Extractor {
                 None
             };
 
-            let children = self.process_children(node.children, full_text)?;
+            // Recursively process children
+            let children = self.process_children(node.children, pages)?;
 
             result.push(DocumentNode {
                 id: node.id,
@@ -145,7 +186,7 @@ impl Extractor {
                 referenced_by: Vec::new(),
                 content_ref,
                 confidence: Some(ConfidenceScores {
-                    ocr: None,
+                    ocr: Some(0.95), // Docling has high OCR confidence
                     extraction: Some(0.8),
                     summary: Some(0.85),
                     low_confidence_regions: Vec::new(),
@@ -222,6 +263,15 @@ struct ExtractedRelationship {
 // Helper functions
 // ============================================================================
 
+/// Slice pages from Docling response for a given page range.
+fn slice_pages(pages: &[PageContent], range: [u32; 2]) -> String {
+    pages.iter()
+        .filter(|p| p.page_num >= range[0] && p.page_num <= range[1])
+        .map(|p| format!("--- Page {} ---\n{}", p.page_num, p.text))
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
 fn truncate_for_context(text: &str, max_chars: usize) -> &str {
     if text.len() <= max_chars {
         text
@@ -231,14 +281,6 @@ fn truncate_for_context(text: &str, max_chars: usize) -> &str {
             end -= 1;
         }
         &text[..end]
-    }
-}
-
-fn extract_content_for_range(_full_text: &str, page_range: Option<[u32; 2]>) -> String {
-    if page_range.is_some() {
-        String::new()
-    } else {
-        String::new()
     }
 }
 
