@@ -1,0 +1,327 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://example.com/document-extraction.schema.json",
+  "title": "HierarchicalDocumentExtraction",
+  "description": "Schema for hierarchical document extraction with nested summaries and cross-references",
+  
+  "type": "object",
+  "required": ["id", "version", "source_file", "extracted_at", "summary", "structure_map", "children"],
+  
+  "properties": {
+    "id": {
+      "type": "string",
+      "description": "Unique extraction identifier"
+    },
+    "source_file": {
+      "type": "string",
+      "description": "Original filename"
+    },
+    "extracted_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "extractor_version": {
+      "type": "string"
+    },
+    "version": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Extraction version number, increments on re-extraction"
+    },
+    "previous_version_id": {
+      "type": ["string", "null"],
+      "description": "ID of previous extraction version, null if first extraction"
+    },
+    "content_hash": {
+      "type": "string",
+      "description": "Hash of source document for change detection"
+    },
+    "total_pages": {
+      "type": "integer",
+      "minimum": 1
+    },
+    
+    "summary": {
+      "type": "string",
+      "description": "High-level summary of entire document for LLM navigation"
+    },
+    
+    "structure_map": {
+      "type": "array",
+      "description": "Flat overview of document structure for quick navigation",
+      "items": { "$ref": "#/$defs/StructureMapEntry" }
+    },
+    
+    "relationships": {
+      "type": "array",
+      "description": "Cross-reference graph at root level",
+      "items": { "$ref": "#/$defs/Relationship" }
+    },
+    
+    "metadata": {
+      "$ref": "#/$defs/ProcessoMetadata",
+      "description": "Process-level metadata (for cópia integral)"
+    },
+    
+    "children": {
+      "type": "array",
+      "description": "Top-level document nodes",
+      "items": { "$ref": "#/$defs/DocumentNode" }
+    }
+  },
+  
+  "$defs": {
+    "StructureMapEntry": {
+      "type": "object",
+      "required": ["id", "label"],
+      "properties": {
+        "id": { "type": "string" },
+        "label": { "type": "string" },
+        "children": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "IDs of child nodes for quick reference"
+        }
+      }
+    },
+    
+    "Relationship": {
+      "type": "object",
+      "required": ["from", "to", "type"],
+      "properties": {
+        "from": {
+          "type": "string",
+          "description": "Source node ID"
+        },
+        "to": {
+          "type": "string",
+          "description": "Target node ID"
+        },
+        "type": {
+          "type": "string",
+          "enum": ["responds_to", "references", "decides_on", "appeals", "cites", "amends", "supersedes"],
+          "description": "Relationship type"
+        },
+        "citation": {
+          "type": ["string", "null"],
+          "description": "Explicit citation text if present (e.g., 'fls. 23-25')"
+        }
+      }
+    },
+    
+    "ProcessoMetadata": {
+      "type": "object",
+      "description": "Metadata specific to Brazilian judicial processes",
+      "properties": {
+        "id": { "type": "string" },
+        "summary": { "type": "string" },
+        "numero": { "type": "string" },
+        "classe": { "type": "string" },
+        "orgao_julgador": { "type": "string" },
+        "ultima_distribuicao": { "type": "string", "format": "date" },
+        "valor_causa": { "type": "number" },
+        "valor_causa_moeda": { "type": "string", "default": "BRL" },
+        "assuntos": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "nivel_sigilo": { "type": "integer" },
+        "justica_gratuita": { "type": "boolean" },
+        "partes": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/Parte" }
+        },
+        "terceiros": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/Parte" }
+        }
+      }
+    },
+    
+    "Parte": {
+      "type": "object",
+      "required": ["id", "nome"],
+      "properties": {
+        "id": { "type": "string" },
+        "polo": { 
+          "type": "string",
+          "enum": ["ATIVO", "PASSIVO", "TERCEIRO"]
+        },
+        "qualificacao": { "type": "string" },
+        "nome": { "type": "string" },
+        "tipo_pessoa": {
+          "type": "string",
+          "enum": ["FÍSICA", "JURÍDICA"]
+        },
+        "documentos": {
+          "type": "object",
+          "properties": {
+            "cpf": { "type": "string" },
+            "cnpj": { "type": "string" },
+            "rg": { "type": "string" }
+          }
+        },
+        "endereco": { "type": "string" },
+        "representante_legal": {
+          "type": "object",
+          "properties": {
+            "nome": { "type": "string" },
+            "relacao": { "type": "string" },
+            "cpf": { "type": "string" }
+          }
+        },
+        "advogados": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/Advogado" }
+        }
+      }
+    },
+    
+    "Advogado": {
+      "type": "object",
+      "properties": {
+        "nome": { "type": "string" },
+        "oab": { "type": ["string", "null"] },
+        "email": { "type": "string" },
+        "telefones": {
+          "type": "array",
+          "items": { "type": "string" }
+        }
+      }
+    },
+    
+    "DocumentNode": {
+      "type": "object",
+      "required": ["id", "type", "summary"],
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Stable unique identifier for this node"
+        },
+        "type": {
+          "type": "string",
+          "enum": ["PETIÇÃO", "DECISÃO", "RECURSO", "CERTIDÃO", "DOCUMENTO", "GRUPO", "SECTION"],
+          "description": "Document type category"
+        },
+        "subtype": {
+          "type": "string",
+          "description": "Specific document subtype (e.g., 'Petição Inicial', 'Contestação')"
+        },
+        "label": {
+          "type": "string",
+          "description": "Display label (for sections/groups)"
+        },
+        "page_range": {
+          "type": "array",
+          "items": { "type": "integer" },
+          "minItems": 2,
+          "maxItems": 2,
+          "description": "[start_page, end_page] in original document numbering"
+        },
+        "pdf_page_range": {
+          "type": "array",
+          "items": { "type": "integer" },
+          "minItems": 2,
+          "maxItems": 2,
+          "description": "[start_page, end_page] in actual PDF pages"
+        },
+        "date": {
+          "type": "string",
+          "format": "date",
+          "description": "Document date (signing/filing)"
+        },
+        "author": {
+          "type": "string",
+          "description": "Document author (attorney, judge, etc.)"
+        },
+        
+        "summary": {
+          "type": "string",
+          "description": "Summary of this node's content"
+        },
+        
+        "references": {
+          "type": "array",
+          "description": "Outgoing references (embedded, denormalized)",
+          "items": { "$ref": "#/$defs/EmbeddedReference" }
+        },
+        "referenced_by": {
+          "type": "array",
+          "description": "Incoming references (embedded, denormalized)",
+          "items": { "$ref": "#/$defs/EmbeddedReference" }
+        },
+        
+        "content_ref": {
+          "type": "string",
+          "description": "URI to full content (lazy-loaded). Format: content://{node_id}. Large content is transparently chunked at content-store level with pagination support."
+        },
+        
+        "confidence": {
+          "$ref": "#/$defs/ConfidenceScores",
+          "description": "Confidence scores for OCR and extraction quality"
+        },
+        
+        "children": {
+          "type": "array",
+          "description": "Nested child nodes (sections, sub-documents)",
+          "items": { "$ref": "#/$defs/DocumentNode" }
+        }
+      }
+    },
+    
+    "EmbeddedReference": {
+      "type": "object",
+      "required": ["node", "type"],
+      "properties": {
+        "node": {
+          "type": "string",
+          "description": "Target node ID"
+        },
+        "type": {
+          "type": "string",
+          "description": "Relationship type"
+        },
+        "citation": {
+          "type": ["string", "null"],
+          "description": "Citation text if present"
+        }
+      }
+    },
+    
+    "ConfidenceScores": {
+      "type": "object",
+      "description": "Confidence scores for extraction quality assessment",
+      "properties": {
+        "ocr": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1,
+          "description": "OCR confidence (0-1), null if not from OCR"
+        },
+        "extraction": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1,
+          "description": "Confidence in structure/boundary extraction"
+        },
+        "summary": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1,
+          "description": "Confidence in summary accuracy"
+        },
+        "low_confidence_regions": {
+          "type": "array",
+          "description": "Flagged regions with extraction issues",
+          "items": {
+            "type": "object",
+            "properties": {
+              "page": { "type": "integer" },
+              "reason": { "type": "string" }
+            }
+          }
+        }
+      }
+    }
+  }
+}

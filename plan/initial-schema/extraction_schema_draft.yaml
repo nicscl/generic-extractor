@@ -1,0 +1,379 @@
+# =============================================================================
+# HIERARCHICAL DOCUMENT EXTRACTION SCHEMA - DRAFT v0.1
+# =============================================================================
+# Design choices:
+#   - Nested tree (nodes contain children directly)
+#   - Every node has a summary
+#   - Cross-references: both embedded AND separate graph at root
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# ROOT LEVEL - The entire extracted document
+# -----------------------------------------------------------------------------
+extraction:
+  id: "ext_abc123"                          # Unique extraction ID
+  source_file: "0266175-44_2023_8_06_0001_-_Ilegitimidade_Ativa.pdf"
+  extracted_at: "2025-02-03T14:32:00Z"
+  extractor_version: "1.0.0"
+  total_pages: 197
+  
+  # ---------------------------------------------------------------------------
+  # GLOBAL SUMMARY - The "map" for LLM navigation
+  # ---------------------------------------------------------------------------
+  summary: |
+    Ação de indenização por danos morais movida por M.S.F. (menor representada 
+    pelo pai) contra Azul Linhas Aéreas por extravio temporário de bagagem em 
+    voo internacional (Fortaleza → Nova York). Bagagem extraviada por 10 dias 
+    durante viagem de férias em família. Sentença de primeira instância julgou 
+    procedente com indenização de R$ 10.000,00. Processo em fase de apelação.
+  
+  # High-level structure for quick navigation
+  structure_map:
+    - id: "processo_meta"
+      label: "Metadados do Processo"
+    - id: "fase_conhecimento"
+      label: "Fase de Conhecimento"
+      children: ["peticao_inicial", "contestacao", "replica", "sentenca"]
+    - id: "fase_recursal"
+      label: "Fase Recursal"
+      children: ["apelacao", "contrarrazoes"]
+    - id: "documentos_anexos"
+      label: "Documentos e Certidões"
+  
+  # ---------------------------------------------------------------------------
+  # CROSS-REFERENCE GRAPH (root-level, queryable)
+  # ---------------------------------------------------------------------------
+  relationships:
+    - from: "contestacao"
+      to: "peticao_inicial"
+      type: "responds_to"
+      citation: null
+    
+    - from: "contestacao"
+      to: "contrato_social"
+      type: "references"
+      citation: "conforme documentos em anexo"
+    
+    - from: "sentenca"
+      to: "peticao_inicial"
+      type: "decides_on"
+      citation: "fls. 01-10"
+    
+    - from: "sentenca"
+      to: "contestacao"
+      type: "decides_on"
+      citation: "fls. 88-106"
+    
+    - from: "apelacao"
+      to: "sentenca"
+      type: "appeals"
+      citation: null
+    
+    - from: "contrarrazoes"
+      to: "apelacao"
+      type: "responds_to"
+      citation: null
+
+  # ---------------------------------------------------------------------------
+  # PROCESSO METADATA NODE
+  # ---------------------------------------------------------------------------
+  metadata:
+    id: "processo_meta"
+    summary: "Processo cível nº 0266175-44.2023.8.06.0001, tramitando na 4ª Vara Cível de Fortaleza, valor da causa R$ 10.000,00, com justiça gratuita deferida."
+    
+    numero: "0266175-44.2023.8.06.0001"
+    classe: "PROCEDIMENTO COMUM CÍVEL"
+    orgao_julgador: "4ª Vara Cível da Comarca de Fortaleza"
+    ultima_distribuicao: "2023-10-02"
+    valor_causa: 10000.00
+    valor_causa_moeda: "BRL"
+    assuntos:
+      - "Extravio de bagagem"
+      - "Transporte Aéreo Internacional"
+      - "Danos Morais"
+    nivel_sigilo: 0
+    sigilo_label: "Público"
+    justica_gratuita: true
+    
+    partes:
+      - id: "parte_autora"
+        polo: "ATIVO"
+        qualificacao: "APELANTE"
+        nome: "M. S. F."  # Redacted - menor
+        tipo_pessoa: "FÍSICA"
+        documentos:
+          cpf: "104.085.343-97"  # From document
+        representante_legal:
+          nome: "Henrique Thiago Freire de Menezes"
+          relacao: "Genitor"
+          cpf: "928.400.193-53"
+        advogados:
+          - nome: "Thiago Nogueira Melo"
+            oab: null  # Extract if available
+            email: "THIAGONOGMELO@HOTMAIL.COM"
+            telefones: ["(085) 98540.3689", "99628.0112"]
+      
+      - id: "parte_re"
+        polo: "PASSIVO"
+        qualificacao: "APELADO"
+        nome: "Azul Linhas Aéreas Brasileiras S.A."
+        tipo_pessoa: "JURÍDICA"
+        documentos:
+          cnpj: "09.296.295/0001-60"
+        endereco: "Av. Senador Carlos Jereissati, 3000, Aeroporto Pinto Martins, Serrinha, Fortaleza-CE, CEP 60741-900"
+        advogados:
+          - nome: "Flavio Igel"
+            oab: null
+    
+    terceiros:
+      - id: "mp"
+        tipo: "TERCEIRO INTERESSADO"
+        nome: "Ministério Público do Estado do Ceará"
+
+  # ---------------------------------------------------------------------------
+  # NESTED DOCUMENT TREE (children array)
+  # ---------------------------------------------------------------------------
+  children:
+    
+    # -------------------------------------------------------------------------
+    # PETIÇÃO INICIAL
+    # -------------------------------------------------------------------------
+    - id: "peticao_inicial"
+      type: "PETIÇÃO"
+      subtype: "Petição Inicial"
+      page_range: [1, 10]  # SAJ pages
+      pdf_page_range: [4, 13]  # Actual PDF pages
+      date: "2023-10-02"
+      author: "Thiago Nogueira Melo (advogado)"
+      
+      summary: |
+        Ação reparatória de danos morais por extravio temporário de bagagem. 
+        Autora (menor) viajou com os pais de Fortaleza para Nova York em 31/08/2023. 
+        Bagagens extraviadas na chegada, permanecendo 10 dias sem pertences durante 
+        férias em família. Requer indenização por danos morais no valor de R$ 10.000,00 
+        e justiça gratuita.
+      
+      # Embedded references (denormalized for convenience when viewing this node)
+      references: []
+      referenced_by:
+        - node: "contestacao"
+          type: "responds_to"
+        - node: "sentenca"
+          type: "decides_on"
+          citation: "fls. 01-10"
+      
+      # Nested children for internal document structure
+      children:
+        - id: "peticao_inicial_sec_fatos"
+          type: "SECTION"
+          label: "DOS FATOS"
+          page_range: [2, 4]
+          summary: |
+            Viagem de férias Fortaleza→NY em 31/08/2023. Bagagens não entregues 
+            na chegada. Família preencheu formulário de irregularidade e aguardou 
+            mais de 1 hora. Somente em 01/09/2023 à meia-noite conseguiram sair 
+            do aeroporto. Bagagens devolvidas apenas 10 dias depois.
+          content_ref: "content://peticao_inicial_sec_fatos"
+        
+        - id: "peticao_inicial_sec_direito"
+          type: "SECTION"
+          label: "DO DIREITO"
+          page_range: [4, 7]
+          summary: |
+            Fundamentação no CDC (arts. 6º, 14, 20), responsabilidade objetiva 
+            do transportador. Cita jurisprudência sobre danos morais in re ipsa 
+            em casos de extravio de bagagem. Convenção de Montreal não limita 
+            indenização por danos morais.
+          content_ref: "content://peticao_inicial_sec_direito"
+        
+        - id: "peticao_inicial_sec_pedidos"
+          type: "SECTION"
+          label: "DOS PEDIDOS"
+          page_range: [8, 10]
+          summary: |
+            Pedidos: (1) justiça gratuita, (2) citação da ré, (3) procedência 
+            com condenação em R$ 10.000,00 por danos morais, (4) honorários 
+            advocatícios, (5) produção de provas.
+          content_ref: "content://peticao_inicial_sec_pedidos"
+    
+    # -------------------------------------------------------------------------
+    # DOCUMENTOS DA INICIAL (nested under a group node)
+    # -------------------------------------------------------------------------
+    - id: "docs_inicial"
+      type: "GRUPO"
+      label: "Documentos da Inicial"
+      page_range: [11, 40]
+      summary: "Documentação apresentada com a inicial: RIB, passagens aéreas, documentos pessoais, declaração de IR."
+      
+      children:
+        - id: "doc_rib"
+          type: "DOCUMENTO"
+          subtype: "RIB - Registro de Irregularidade de Bagagem"
+          page_range: [11, 12]
+          summary: "Formulário de registro de irregularidade de bagagem preenchido no aeroporto JFK em 31/08/2023."
+          content_ref: "content://doc_rib"
+          
+        - id: "doc_passagens"
+          type: "DOCUMENTO"
+          subtype: "Passagens Aéreas"
+          page_range: [13, 18]
+          summary: "Bilhetes eletrônicos do voo AD 7016 Fortaleza-Campinas e conexão para Nova York em 31/08/2023."
+          content_ref: "content://doc_passagens"
+    
+    # -------------------------------------------------------------------------
+    # CONTESTAÇÃO
+    # -------------------------------------------------------------------------
+    - id: "contestacao"
+      type: "PETIÇÃO"
+      subtype: "Contestação"
+      page_range: [88, 106]
+      pdf_page_range: [91, 109]
+      date: "2024-07-10"
+      author: "Flavio Igel (advogado)"
+      
+      summary: |
+        Azul contesta alegando: (1) ilegitimidade ativa da menor - contrato 
+        firmado pelos pais, (2) extravio foi temporário e resolvido em prazo 
+        razoável, (3) ausência de comprovação de danos, (4) valor pleiteado 
+        é excessivo, (5) aplicação da Convenção de Montreal para limitar 
+        indenização. Requer improcedência total.
+      
+      references:
+        - node: "peticao_inicial"
+          type: "responds_to"
+        - node: "contrato_social"
+          type: "references"
+          citation: "conforme documentos em anexo"
+      referenced_by:
+        - node: "sentenca"
+          type: "decides_on"
+      
+      children:
+        - id: "contestacao_sec_preliminar"
+          type: "SECTION"
+          label: "DA PRELIMINAR - ILEGITIMIDADE ATIVA"
+          summary: |
+            Alega que a menor não é parte legítima pois não celebrou o contrato 
+            de transporte. Os pais adquiriram as passagens e são os verdadeiros 
+            contratantes.
+          content_ref: "content://contestacao_sec_preliminar"
+        
+        - id: "contestacao_sec_merito"
+          type: "SECTION"
+          label: "DO MÉRITO"
+          summary: |
+            Bagagem foi devolvida em 10 dias, prazo razoável para voo internacional. 
+            Não houve extravio definitivo. Autora não comprovou prejuízos efetivos.
+          content_ref: "content://contestacao_sec_merito"
+    
+    # -------------------------------------------------------------------------
+    # SENTENÇA
+    # -------------------------------------------------------------------------
+    - id: "sentenca"
+      type: "DECISÃO"
+      subtype: "Sentença"
+      page_range: [133, 145]
+      date: "2025-07-17"
+      author: "Juiz(a) da 4ª Vara Cível"
+      
+      summary: |
+        Sentença julga PROCEDENTE o pedido. Rejeita preliminar de ilegitimidade 
+        ativa - menor é consumidora por equiparação (art. 2º, p.ú., CDC). No 
+        mérito, reconhece dano moral in re ipsa pelo extravio de 10 dias. Condena 
+        Azul a pagar R$ 10.000,00 + correção monetária + juros de mora desde 
+        citação. Honorários de 10% sobre o valor da condenação.
+      
+      references:
+        - node: "peticao_inicial"
+          type: "decides_on"
+          citation: "fls. 01-10"
+        - node: "contestacao"
+          type: "decides_on"
+      referenced_by:
+        - node: "apelacao"
+          type: "appeals"
+      
+      children:
+        - id: "sentenca_sec_relatorio"
+          type: "SECTION"
+          label: "RELATÓRIO"
+          summary: "Síntese do processo: ação de danos morais, contestação com preliminar de ilegitimidade, réplica."
+          content_ref: "content://sentenca_sec_relatorio"
+        
+        - id: "sentenca_sec_fundamentacao"
+          type: "SECTION"
+          label: "FUNDAMENTAÇÃO"
+          summary: |
+            Rejeita ilegitimidade - menor é consumidora por equiparação. 
+            Responsabilidade objetiva do transportador. Dano moral in re ipsa. 
+            10 dias sem bagagem em viagem de férias configura lesão a direitos 
+            da personalidade. Valor de R$ 10.000 é proporcional.
+          content_ref: "content://sentenca_sec_fundamentacao"
+        
+        - id: "sentenca_sec_dispositivo"
+          type: "SECTION"
+          label: "DISPOSITIVO"
+          summary: |
+            JULGO PROCEDENTE. Condeno Azul Linhas Aéreas a pagar R$ 10.000,00 
+            a título de danos morais. Correção pelo INPC desde arbitramento. 
+            Juros de 1% a.m. desde citação. Honorários de 10%.
+          content_ref: "content://sentenca_sec_dispositivo"
+    
+    # -------------------------------------------------------------------------
+    # APELAÇÃO
+    # -------------------------------------------------------------------------
+    - id: "apelacao"
+      type: "RECURSO"
+      subtype: "Apelação"
+      page_range: [150, 165]
+      date: "2025-07-10"
+      author: "Flavio Igel (advogado)"
+      
+      summary: |
+        Azul apela reiterando: ilegitimidade ativa da menor, ausência de 
+        comprovação de dano efetivo, valor excessivo da condenação. Pede 
+        reforma total ou redução do quantum indenizatório.
+      
+      references:
+        - node: "sentenca"
+          type: "appeals"
+      referenced_by:
+        - node: "contrarrazoes"
+          type: "responds_to"
+      
+      content_ref: "content://apelacao"
+    
+    # -------------------------------------------------------------------------
+    # CONTRARRAZÕES
+    # -------------------------------------------------------------------------
+    - id: "contrarrazoes"
+      type: "RECURSO"
+      subtype: "Contrarrazões à Apelação"
+      page_range: [170, 180]
+      date: "2025-08-10"
+      author: "Thiago Nogueira Melo (advogado)"
+      
+      summary: |
+        Autora rebate todos os argumentos da apelação. Sustenta que a sentença 
+        está correta em todos os pontos. Menor é consumidora por equiparação. 
+        Dano moral é presumido em extravio de bagagem. Valor é adequado à 
+        jurisprudência. Pede manutenção integral da sentença.
+      
+      references:
+        - node: "apelacao"
+          type: "responds_to"
+      
+      content_ref: "content://contrarrazoes"
+
+# =============================================================================
+# CONTENT STORE (referenced by content_ref fields)
+# =============================================================================
+# In practice, this would be a separate blob store or lazy-loaded on demand.
+# Each content_ref points to the full extracted text/OCR of that section.
+# 
+# Example:
+#   content://peticao_inicial_sec_fatos -> 
+#     "1. DOS FATOS:\n\nVisando viajar aos Estados Unidos, a Promovente e os 
+#      pais adquiriram passagens aéreas da Promovida. A viagem de ida estava 
+#      prevista para o dia 31/08/2023, saindo 5h de Fortaleza..."
+# =============================================================================
