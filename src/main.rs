@@ -19,7 +19,7 @@ use content_store::{ContentChunk, ContentStore};
 use extractor::{DoclingResponse, Extractor};
 use openrouter::OpenRouterClient;
 use schema::Extraction;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
@@ -323,18 +323,57 @@ struct ExtractionSummary {
     node_count: usize,
 }
 
+/// Try to get an extraction from memory, falling back to Supabase if configured.
+/// Caches hydrated extractions in memory for subsequent requests.
+async fn get_or_hydrate_extraction(state: &AppState, id: &str) -> Option<Extraction> {
+    // 1. Check in-memory cache
+    {
+        let extractions = state.extractions.read().unwrap();
+        if let Some(extraction) = extractions.get(id) {
+            return Some(extraction.clone());
+        }
+    }
+
+    // 2. Fall back to Supabase
+    if let Some(ref supabase) = state.supabase {
+        match supabase
+            .fetch_extraction(id, &state.content_store)
+            .await
+        {
+            Ok(Some(extraction)) => {
+                // Cache in memory for future requests
+                let mut extractions = state.extractions.write().unwrap();
+                extractions.insert(extraction.id.clone(), extraction.clone());
+                info!("Hydrated extraction {} from Supabase into cache", id);
+                return Some(extraction);
+            }
+            Ok(None) => {
+                debug!("Extraction {} not found in Supabase", id);
+            }
+            Err(e) => {
+                error!("Failed to fetch extraction {} from Supabase: {}", id, e);
+            }
+        }
+    }
+
+    None
+}
+
 /// List all extractions (lightweight summaries).
+/// Merges in-memory extractions with Supabase if configured.
 async fn list_extractions(
     State(state): State<AppState>,
 ) -> Json<Vec<ExtractionSummary>> {
-    let extractions = state.extractions.read().unwrap();
-    let mut list: Vec<ExtractionSummary> = extractions
-        .values()
-        .map(|e| {
-            fn count_nodes(nodes: &[schema::DocumentNode]) -> usize {
-                nodes.iter().map(|n| 1 + count_nodes(&n.children)).sum()
-            }
-            ExtractionSummary {
+    fn count_nodes(nodes: &[schema::DocumentNode]) -> usize {
+        nodes.iter().map(|n| 1 + count_nodes(&n.children)).sum()
+    }
+
+    // Collect in-memory extractions
+    let mut list: Vec<ExtractionSummary> = {
+        let extractions = state.extractions.read().unwrap();
+        extractions
+            .values()
+            .map(|e| ExtractionSummary {
                 id: e.id.clone(),
                 source_file: e.source_file.clone(),
                 config_name: e.config_name.clone(),
@@ -342,22 +381,47 @@ async fn list_extractions(
                 total_pages: e.total_pages,
                 summary: e.summary.clone(),
                 node_count: count_nodes(&e.children),
+            })
+            .collect()
+    };
+
+    // Merge Supabase extractions (dedup by ID)
+    if let Some(ref supabase) = state.supabase {
+        match supabase.list_extractions().await {
+            Ok(rows) => {
+                let in_memory_ids: HashSet<String> =
+                    list.iter().map(|e| e.id.clone()).collect();
+                for row in rows {
+                    if !in_memory_ids.contains(&row.id) {
+                        list.push(ExtractionSummary {
+                            id: row.id,
+                            source_file: row.source_file,
+                            config_name: row.config_name,
+                            extracted_at: row.extracted_at,
+                            total_pages: row.total_pages,
+                            summary: row.summary,
+                            node_count: 0, // not hydrated yet
+                        });
+                    }
+                }
             }
-        })
-        .collect();
+            Err(e) => {
+                error!("Failed to list extractions from Supabase: {}", e);
+            }
+        }
+    }
+
     list.sort_by(|a, b| b.extracted_at.cmp(&a.extracted_at));
     Json(list)
 }
 
-/// Get an extraction by ID.
+/// Get an extraction by ID (in-memory + Supabase fallback).
 async fn get_extraction(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<Extraction>, StatusCode> {
-    let extractions = state.extractions.read().unwrap();
-    extractions
-        .get(&id)
-        .cloned()
+    get_or_hydrate_extraction(&state, &id)
+        .await
         .map(Json)
         .ok_or(StatusCode::NOT_FOUND)
 }
@@ -394,10 +458,9 @@ async fn get_extraction_snapshot(
     Path(id): Path<String>,
     Query(query): Query<SnapshotQuery>,
 ) -> Result<Json<ExtractionSnapshot>, StatusCode> {
-    let extraction = {
-        let extractions = state.extractions.read().unwrap();
-        extractions.get(&id).cloned().ok_or(StatusCode::NOT_FOUND)?
-    };
+    let extraction = get_or_hydrate_extraction(&state, &id)
+        .await
+        .ok_or(StatusCode::NOT_FOUND)?;
 
     let include_content_meta = query.include_content_meta.unwrap_or(true);
     let content_index = if include_content_meta {
@@ -415,13 +478,14 @@ async fn get_extraction_snapshot(
     }))
 }
 
-/// Get a specific node from an extraction.
+/// Get a specific node from an extraction (in-memory + Supabase fallback).
 async fn get_node(
     State(state): State<AppState>,
     Path((id, node_id)): Path<(String, String)>,
 ) -> Result<Json<schema::DocumentNode>, StatusCode> {
-    let extractions = state.extractions.read().unwrap();
-    let extraction = extractions.get(&id).ok_or(StatusCode::NOT_FOUND)?;
+    let extraction = get_or_hydrate_extraction(&state, &id)
+        .await
+        .ok_or(StatusCode::NOT_FOUND)?;
 
     find_node(&extraction.children, &node_id)
         .cloned()
@@ -435,7 +499,7 @@ struct ContentQuery {
     limit: Option<usize>,
 }
 
-/// Get content by reference with pagination.
+/// Get content by reference with pagination (in-memory + Supabase fallback).
 async fn get_content(
     State(state): State<AppState>,
     Path(ref_path): Path<String>,
@@ -445,18 +509,40 @@ async fn get_content(
     let offset = query.offset.unwrap_or(0);
     let limit = query.limit.unwrap_or(4000);
 
-    info!(
-        "get_content: ref_path='{}', content_ref='{}', exists={}",
-        ref_path,
-        content_ref,
-        state.content_store.exists(&content_ref)
-    );
+    // 1. Try in-memory content store
+    if let Some(chunk) = state.content_store.get(&content_ref, offset, limit) {
+        return Ok(Json(chunk));
+    }
 
-    state
-        .content_store
-        .get(&content_ref, offset, limit)
-        .map(Json)
-        .ok_or(StatusCode::NOT_FOUND)
+    // 2. Fall back to Supabase
+    if let Some(ref supabase) = state.supabase {
+        match supabase.fetch_content_by_node_id(&ref_path).await {
+            Ok(Some(content)) => {
+                info!(
+                    "Hydrated content for {} from Supabase ({} chars)",
+                    ref_path,
+                    content.len()
+                );
+                // Cache in content store
+                state.content_store.store(&ref_path, content);
+                // Now serve from store (applies pagination)
+                if let Some(chunk) = state.content_store.get(&content_ref, offset, limit) {
+                    return Ok(Json(chunk));
+                }
+            }
+            Ok(None) => {
+                debug!("Content for {} not found in Supabase", ref_path);
+            }
+            Err(e) => {
+                error!(
+                    "Failed to fetch content for {} from Supabase: {}",
+                    ref_path, e
+                );
+            }
+        }
+    }
+
+    Err(StatusCode::NOT_FOUND)
 }
 
 // ============================================================================
