@@ -2,6 +2,7 @@
 
 use crate::config::ExtractionConfig;
 use crate::content_store::ContentStore;
+use crate::entities::{self, CompiledPatterns};
 use crate::openrouter::{Message, OpenRouterClient};
 use crate::schema::{
     ConfidenceScores, DocumentNode, EmbeddedReference, Extraction, Relationship, StructureMapEntry,
@@ -136,6 +137,35 @@ impl Extractor {
         // Process children and populate content_ref with page-sliced OCR
         extraction.children = self.process_children(extracted.children, &docling.pages)?;
 
+        // Run regex-based entity extraction if config has patterns
+        if !config.entity_patterns.is_empty() {
+            let compiled = CompiledPatterns::compile(&config.entity_patterns);
+            if !compiled.is_empty() {
+                let (node_entity_map, mut ref_index) = entities::extract_entities(
+                    &extraction.children,
+                    &self.content_store,
+                    &compiled,
+                );
+
+                // Deduplicate node_ids in the global reference index
+                entities::dedup_reference_index(&mut ref_index);
+
+                // Merge regex entities into node metadata under `_entities` key
+                // LLM-provided metadata takes precedence (regex goes under `_entities`)
+                merge_entities_into_nodes(&mut extraction.children, &node_entity_map);
+
+                // Set extraction-level reference_index
+                extraction.reference_index =
+                    serde_json::to_value(&ref_index).unwrap_or(serde_json::Value::Null);
+
+                info!(
+                    "Entity extraction: {} entity types across {} nodes",
+                    ref_index.entities.len(),
+                    node_entity_map.len()
+                );
+            }
+        }
+
         info!(
             "Extraction complete: {} top-level nodes, {} relationships",
             extraction.children.len(),
@@ -195,7 +225,7 @@ impl Extractor {
                     summary: Some(0.85),
                     low_confidence_regions: Vec::new(),
                 }),
-                metadata: serde_json::Value::Null,
+                metadata: node.metadata.unwrap_or(serde_json::Value::Null),
                 children,
             });
         }
@@ -238,6 +268,8 @@ struct ExtractedNode {
     author: Option<String>,
     #[serde(default)]
     summary: String,
+    #[serde(default)]
+    metadata: Option<serde_json::Value>,
     #[serde(default)]
     references: Vec<ExtractedRef>,
     #[serde(default)]
@@ -286,6 +318,29 @@ fn truncate_for_context(text: &str, max_chars: usize) -> &str {
             end -= 1;
         }
         &text[..end]
+    }
+}
+
+/// Recursively merge extracted entities into node metadata under `_entities` key.
+/// LLM-provided metadata fields are preserved; regex entities are added alongside them.
+fn merge_entities_into_nodes(
+    nodes: &mut [DocumentNode],
+    entity_map: &std::collections::HashMap<String, serde_json::Value>,
+) {
+    for node in nodes.iter_mut() {
+        if let Some(entities) = entity_map.get(&node.id) {
+            // Ensure metadata is an object
+            if node.metadata.is_null() {
+                node.metadata = serde_json::Value::Object(serde_json::Map::new());
+            }
+            if let Some(obj) = node.metadata.as_object_mut() {
+                obj.insert("_entities".to_string(), entities.clone());
+            }
+        }
+
+        if !node.children.is_empty() {
+            merge_entities_into_nodes(&mut node.children, entity_map);
+        }
     }
 }
 

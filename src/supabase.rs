@@ -63,6 +63,12 @@ impl SupabaseClient {
     async fn insert_extraction(&self, extraction: &Extraction) -> Result<()> {
         let url = format!("{}/rest/v1/extractions", self.base_url);
 
+        let reference_index = if extraction.reference_index.is_null() {
+            None
+        } else {
+            Some(&extraction.reference_index)
+        };
+
         let body = json!({
             "id": extraction.id,
             "config_name": extraction.config_name,
@@ -72,6 +78,7 @@ impl SupabaseClient {
             "summary": extraction.summary,
             "structure_map": extraction.structure_map,
             "metadata": extraction.metadata,
+            "reference_index": reference_index,
             "extracted_at": extraction.extracted_at,
             "extractor_version": extraction.extractor_version,
         });
@@ -152,6 +159,12 @@ impl SupabaseClient {
             .map(|arr| (Some(arr[0]), Some(arr[1])))
             .unwrap_or((None, None));
 
+        let metadata = if node.metadata.is_null() {
+            None
+        } else {
+            Some(&node.metadata)
+        };
+
         let body = json!({
             "id": node.id,
             "extraction_id": extraction_id,
@@ -165,6 +178,7 @@ impl SupabaseClient {
             "author": node.author,
             "summary": node.summary,
             "confidence": node.confidence,
+            "metadata": metadata,
         });
 
         let resp = self
@@ -404,6 +418,7 @@ impl SupabaseClient {
             structure_map: row.structure_map.unwrap_or_default(),
             relationships,
             metadata: row.metadata.unwrap_or(serde_json::Value::Null),
+            reference_index: row.reference_index.unwrap_or(serde_json::Value::Null),
             children,
         };
 
@@ -455,6 +470,7 @@ pub struct ExtractionRow {
     pub summary: String,
     pub structure_map: Option<Vec<StructureMapEntry>>,
     pub metadata: Option<serde_json::Value>,
+    pub reference_index: Option<serde_json::Value>,
     pub extracted_at: String,
     pub extractor_version: Option<String>,
 }
@@ -473,6 +489,8 @@ struct NodeRow {
     author: Option<String>,
     summary: String,
     confidence: Option<ConfidenceScores>,
+    #[serde(default)]
+    metadata: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -546,7 +564,7 @@ fn build_tree(
             referenced_by: Vec::new(),
             content_ref,
             confidence: row.confidence.clone(),
-            metadata: serde_json::Value::Null,
+            metadata: row.metadata.clone().unwrap_or(serde_json::Value::Null),
             children,
         }
     }

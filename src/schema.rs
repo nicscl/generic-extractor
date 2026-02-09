@@ -96,6 +96,9 @@ pub struct Extraction {
     /// Dynamic metadata - structure defined by config
     #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
     pub metadata: serde_json::Value,
+    /// Global reference index: entity type → occurrences with node IDs
+    #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
+    pub reference_index: serde_json::Value,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub children: Vec<DocumentNode>,
 }
@@ -118,6 +121,7 @@ impl Extraction {
             structure_map: Vec::new(),
             relationships: Vec::new(),
             metadata: serde_json::Value::Null,
+            reference_index: serde_json::Value::Null,
             children: Vec::new(),
         }
     }

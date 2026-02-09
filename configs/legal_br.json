@@ -2,7 +2,7 @@
     "name": "legal_br",
     "description": "Brazilian legal case files (cópias integrais de processos judiciais)",
     "prompts": {
-        "structure": "Você é um analisador especializado em documentos jurídicos brasileiros. Analise o documento fornecido e extraia sua estrutura hierárquica.\n\nIdentifique:\n1. Tipo de documento (petição, decisão, recurso, certidão, documento)\n2. Seções dentro de cada documento\n3. Intervalos de páginas\n4. Autores e datas quando visíveis\n5. Referências cruzadas entre documentos\n\nRetorne um objeto JSON com esta estrutura:\n{\n  \"summary\": \"Resumo de 2-4 frases do documento completo\",\n  \"metadata\": {\n    \"numero\": \"número do processo (formato CNJ)\",\n    \"classe\": \"classe processual\",\n    \"orgao_julgador\": \"órgão julgador\",\n    \"partes\": [{\"id\": \"parte_1\", \"nome\": \"Nome\", \"polo\": \"ATIVO ou PASSIVO\"}]\n  },\n  \"children\": [\n    {\n      \"id\": \"id_unico\",\n      \"type\": \"PETICAO|DECISAO|RECURSO|CERTIDAO|DOCUMENTO|GRUPO|SECTION\",\n      \"subtype\": \"Tipo específico (ex: Petição Inicial, Contestação)\",\n      \"label\": \"Rótulo para exibição\",\n      \"page_range\": [inicio, fim],\n      \"date\": \"YYYY-MM-DD se conhecido\",\n      \"author\": \"Nome do autor\",\n      \"summary\": \"Resumo de 2-4 frases\",\n      \"children\": []\n    }\n  ],\n  \"relationships\": [\n    {\"from\": \"id_origem\", \"to\": \"id_destino\", \"type\": \"responds_to|references|decides_on|appeals\"}\n  ]\n}\n\nSeja detalhado mas conciso. Foque na estrutura do documento, não na extração completa do conteúdo."
+        "structure": "Você é um analisador especializado em documentos jurídicos brasileiros. Analise o documento fornecido e extraia sua estrutura hierárquica.\n\nIdentifique:\n1. Tipo de documento (petição, decisão, recurso, certidão, documento)\n2. Seções dentro de cada documento\n3. Intervalos de páginas\n4. Autores e datas quando visíveis\n5. Referências cruzadas entre documentos\n\nRetorne um objeto JSON com esta estrutura:\n{\n  \"summary\": \"Resumo de 2-4 frases do documento completo\",\n  \"metadata\": {\n    \"numero\": \"número do processo (formato CNJ)\",\n    \"classe\": \"classe processual\",\n    \"orgao_julgador\": \"órgão julgador\",\n    \"partes\": [{\"id\": \"parte_1\", \"nome\": \"Nome\", \"polo\": \"ATIVO ou PASSIVO\"}]\n  },\n  \"children\": [\n    {\n      \"id\": \"id_unico\",\n      \"type\": \"PETICAO|DECISAO|RECURSO|CERTIDAO|DOCUMENTO|GRUPO|SECTION\",\n      \"subtype\": \"Tipo específico - use subtipos detalhados (ver lista abaixo)\",\n      \"label\": \"Rótulo para exibição - inclua identificadores chave (códigos, números)\",\n      \"page_range\": [inicio, fim],\n      \"date\": \"YYYY-MM-DD se conhecido\",\n      \"author\": \"Nome do autor\",\n      \"summary\": \"Resumo DENSO com dados concretos: inclua números de processo, valores monetários, códigos de reserva, números de voo, CPF/CNPJ, datas específicas. Ex: 'Petição inicial de João Silva (CPF 123.456.789-00) contra Azul Linhas Aéreas, pedindo R$ 15.000,00 por danos morais referente ao voo AD2602 (PNR VJL28Z) de 15/03/2024.'\",\n      \"metadata\": {\n        \"_comment\": \"Inclua aqui identificadores e dados estruturados encontrados neste nó\",\n        \"companhia\": \"Nome da empresa se aplicável\",\n        \"valor\": \"Valor monetário principal se houver\",\n        \"protocolo\": \"Número de protocolo se houver\"\n      },\n      \"children\": []\n    }\n  ],\n  \"relationships\": [\n    {\"from\": \"id_origem\", \"to\": \"id_destino\", \"type\": \"responds_to|references|decides_on|appeals\"}\n  ]\n}\n\nREGRAS IMPORTANTES PARA METADATA POR NÓ:\n- Cada nó pode ter um campo \"metadata\" (objeto JSON) com identificadores chave encontrados naquele trecho\n- Inclua: códigos de reserva (PNR), números de voo, valores monetários, CPF/CNPJ, números de protocolo, datas relevantes\n- O campo metadata é opcional - só inclua quando houver dados estruturados relevantes\n\nREGRAS PARA SUMMARIES DENSOS:\n- NÃO escreva resumos genéricos como \"Petição sobre danos morais\" ou \"Documento de viagem\"\n- SEMPRE inclua dados concretos: nomes, valores, códigos, datas, números\n- Exemplo BOM: \"Bilhete aéreo Azul, PNR VJL28Z, voo AD2602 GRU→VCP, 15/03/2024, R$ 450,00\"\n- Exemplo RUIM: \"Bilhete aéreo de viagem\"\n\nSUBTIPOS PARA DOCUMENTO:\n- Use subtipos específicos: \"Bilhete Aéreo\", \"Comprovante de Pagamento\", \"Nota Fiscal\", \"Contrato\", \"Print de Tela\", \"Foto\", \"Declaração\", \"Protocolo de Atendimento\", \"Procuração\", \"Comprovante\", \"Laudo\", \"Ata\"\n\nSeja detalhado mas conciso. Foque na estrutura do documento E nos identificadores chave."
     },
     "node_types": [
         {
@@ -51,7 +51,15 @@
                 "Procuração",
                 "Comprovante",
                 "Laudo",
-                "Ata"
+                "Ata",
+                "Bilhete Aéreo",
+                "Comprovante de Pagamento",
+                "Nota Fiscal",
+                "Contrato",
+                "Print de Tela",
+                "Foto",
+                "Declaração",
+                "Protocolo de Atendimento"
             ]
         },
         {
@@ -133,5 +141,77 @@
                 }
             }
         }
-    }
+    },
+    "entity_patterns": [
+        {
+            "id": "cpf",
+            "label": "CPF",
+            "pattern": "(\\d{3}\\.\\d{3}\\.\\d{3}-\\d{2})",
+            "normalize": "strip_punctuation",
+            "deduplicate": true
+        },
+        {
+            "id": "cnpj",
+            "label": "CNPJ",
+            "pattern": "(\\d{2}\\.\\d{3}\\.\\d{3}/\\d{4}-\\d{2})",
+            "normalize": "strip_punctuation",
+            "deduplicate": true
+        },
+        {
+            "id": "processo_cnj",
+            "label": "Processo CNJ",
+            "pattern": "(\\d{7}-\\d{2}\\.\\d{4}\\.\\d\\.\\d{2}\\.\\d{4})",
+            "normalize": null,
+            "deduplicate": true
+        },
+        {
+            "id": "pnr",
+            "label": "PNR / Localizador",
+            "pattern": "(?:PNR|[Ll]ocalizador|[Cc]ódigo de [Rr]eserva|[Rr]eserva)[:\\s]+([A-Z0-9]{5,6})",
+            "normalize": "uppercase",
+            "deduplicate": true
+        },
+        {
+            "id": "flight_number",
+            "label": "Número de Voo",
+            "pattern": "(?:[Vv]oo|[Ff]light)\\s*:?\\s*([A-Z]{2}\\d{3,4})",
+            "normalize": "uppercase",
+            "deduplicate": true
+        },
+        {
+            "id": "monetary_brl",
+            "label": "Valor em Reais",
+            "pattern": "R\\$\\s*([\\d.,]+\\d{2})",
+            "normalize": null,
+            "deduplicate": true
+        },
+        {
+            "id": "date_br",
+            "label": "Data (formato BR)",
+            "pattern": "(\\d{2}/\\d{2}/\\d{4})",
+            "normalize": null,
+            "deduplicate": true
+        },
+        {
+            "id": "oab",
+            "label": "OAB",
+            "pattern": "OAB[/\\s]*([A-Z]{2})[\\s]*[Nn]?[°º.]?\\s*(\\d{3,6})",
+            "normalize": "uppercase",
+            "deduplicate": true
+        },
+        {
+            "id": "email",
+            "label": "E-mail",
+            "pattern": "([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,})",
+            "normalize": null,
+            "deduplicate": true
+        },
+        {
+            "id": "phone_br",
+            "label": "Telefone",
+            "pattern": "(?:\\+55\\s?)?\\(?\\d{2}\\)?\\s?\\d{4,5}[-\\s]?\\d{4}",
+            "normalize": null,
+            "deduplicate": true
+        }
+    ]
 }

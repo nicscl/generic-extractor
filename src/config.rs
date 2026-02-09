@@ -22,6 +22,9 @@ pub struct ExtractionConfig {
     pub relationship_types: Vec<String>,
     #[serde(default)]
     pub metadata_schema: serde_json::Value,
+    /// Regex-based entity patterns for extracting structured identifiers from OCR text.
+    #[serde(default)]
+    pub entity_patterns: Vec<EntityPattern>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -42,6 +45,27 @@ pub struct NodeTypeConfig {
     pub label: String,
     #[serde(default)]
     pub subtypes: Vec<String>,
+}
+
+/// A regex-based entity pattern for extracting structured identifiers from OCR text.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EntityPattern {
+    /// Unique identifier for this pattern (e.g. "cpf", "pnr", "flight_number")
+    pub id: String,
+    /// Human-readable label (e.g. "CPF", "PNR / Localizador")
+    pub label: String,
+    /// Regex pattern string (should contain a capture group for the value)
+    pub pattern: String,
+    /// Optional normalization: "uppercase" | "strip_punctuation"
+    #[serde(default)]
+    pub normalize: Option<String>,
+    /// Whether to deduplicate matches within a node (default true)
+    #[serde(default = "default_true")]
+    pub deduplicate: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// In-memory store for all loaded configs.
@@ -146,5 +170,6 @@ Return a JSON object with:
         ],
         relationship_types: vec!["references".to_string(), "contains".to_string()],
         metadata_schema: serde_json::json!({}),
+        entity_patterns: Vec::new(),
     }
 }

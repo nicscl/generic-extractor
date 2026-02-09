@@ -2,6 +2,7 @@
 
 mod config;
 mod content_store;
+mod entities;
 mod extractor;
 mod openrouter;
 mod schema;
