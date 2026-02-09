@@ -2,11 +2,16 @@
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { z } from "zod";
 import { readFile } from "node:fs/promises";
 import { basename } from "node:path";
+import { createServer } from "node:http";
+import { randomUUID } from "node:crypto";
 
 const API_URL = process.env.EXTRACTOR_API_URL ?? "http://localhost:3002";
+const TRANSPORT = process.env.MCP_TRANSPORT ?? "stdio"; // "stdio" or "http"
+const MCP_PORT = parseInt(process.env.MCP_PORT ?? "3003", 10);
 
 // ---------------------------------------------------------------------------
 // HTTP helper
@@ -171,8 +176,54 @@ server.tool(
 // ---------------------------------------------------------------------------
 
 async function main() {
-  const transport = new StdioServerTransport();
+  if (TRANSPORT === "http") {
+    await startHttp();
+  } else {
+    const transport = new StdioServerTransport();
+    await server.connect(transport);
+  }
+}
+
+async function startHttp() {
+  const transport = new StreamableHTTPServerTransport({
+    sessionIdGenerator: () => randomUUID(),
+  });
+
   await server.connect(transport);
+
+  const httpServer = createServer(async (req, res) => {
+    const url = req.url ?? "";
+
+    // Health check
+    if (url === "/health" && req.method === "GET") {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ status: "ok" }));
+      return;
+    }
+
+    // MCP endpoint
+    if (url === "/mcp" || url.startsWith("/mcp?")) {
+      // Parse body for POST requests
+      if (req.method === "POST") {
+        const chunks: Buffer[] = [];
+        for await (const chunk of req) {
+          chunks.push(chunk as Buffer);
+        }
+        const body = JSON.parse(Buffer.concat(chunks).toString());
+        await transport.handleRequest(req, res, body);
+      } else {
+        await transport.handleRequest(req, res);
+      }
+      return;
+    }
+
+    res.writeHead(404);
+    res.end("Not found");
+  });
+
+  httpServer.listen(MCP_PORT, "127.0.0.1", () => {
+    console.error(`MCP HTTP server listening on http://127.0.0.1:${MCP_PORT}/mcp`);
+  });
 }
 
 main().catch((err) => {
