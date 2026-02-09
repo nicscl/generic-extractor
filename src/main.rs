@@ -26,8 +26,10 @@ use tower_http::trace::TraceLayer;
 use tracing::{debug, error, info};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-/// Docling sidecar URL (runs on port 3001)
-const DOCLING_SIDECAR_URL: &str = "http://localhost:3001";
+/// Docling sidecar URL (configurable via DOCLING_URL env var)
+fn docling_url() -> String {
+    std::env::var("DOCLING_URL").unwrap_or_else(|_| "http://localhost:3001".to_string())
+}
 
 /// Application state shared across handlers.
 #[derive(Clone)]
@@ -110,7 +112,7 @@ async fn main() -> anyhow::Result<()> {
     let addr = format!("0.0.0.0:{}", port);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     info!("Server listening on http://{}", addr);
-    info!("Docling sidecar expected at {}", DOCLING_SIDECAR_URL);
+    info!("Docling sidecar expected at {}", docling_url());
     axum::serve(listener, app).await?;
 
     Ok(())
@@ -350,7 +352,7 @@ async fn call_docling_sidecar(
     let form = Form::new().part("file", part);
 
     let response = client
-        .post(format!("{}/convert", DOCLING_SIDECAR_URL))
+        .post(format!("{}/convert", docling_url()))
         .multipart(form)
         .send()
         .await?;
