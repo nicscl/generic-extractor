@@ -44,6 +44,18 @@ function registerTools(server: McpServer) {
   );
 
   server.tool(
+    "list_extractions",
+    "List all available extractions with their IDs, source files, summaries, and page counts. Use this to find extraction IDs for get_extraction_snapshot.",
+    {},
+    async () => {
+      const extractions = await api("/extractions");
+      return {
+        content: [{ type: "text", text: JSON.stringify(extractions, null, 2) }],
+      };
+    },
+  );
+
+  server.tool(
     "extract_document",
     "Upload a PDF file and run the extraction pipeline. Returns the full extraction result with ID, summary, structure map, and document tree.",
     {

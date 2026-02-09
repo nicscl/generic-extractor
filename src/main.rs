@@ -95,6 +95,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/configs", get(list_configs))
         .route("/configs/:name", get(get_config))
         .route("/extract", post(extract_document))
+        .route("/extractions", get(list_extractions))
         .route("/extractions/:id/snapshot", get(get_extraction_snapshot))
         .route("/extractions/:id", get(get_extraction))
         .route("/extractions/:id/node/:node_id", get(get_node))
@@ -309,6 +310,43 @@ async fn call_docling_sidecar(
 
     let docling: DoclingResponse = response.json().await?;
     Ok(docling)
+}
+
+#[derive(serde::Serialize)]
+struct ExtractionSummary {
+    id: String,
+    source_file: String,
+    config_name: Option<String>,
+    extracted_at: String,
+    total_pages: Option<u32>,
+    summary: String,
+    node_count: usize,
+}
+
+/// List all extractions (lightweight summaries).
+async fn list_extractions(
+    State(state): State<AppState>,
+) -> Json<Vec<ExtractionSummary>> {
+    let extractions = state.extractions.read().unwrap();
+    let mut list: Vec<ExtractionSummary> = extractions
+        .values()
+        .map(|e| {
+            fn count_nodes(nodes: &[schema::DocumentNode]) -> usize {
+                nodes.iter().map(|n| 1 + count_nodes(&n.children)).sum()
+            }
+            ExtractionSummary {
+                id: e.id.clone(),
+                source_file: e.source_file.clone(),
+                config_name: e.config_name.clone(),
+                extracted_at: e.extracted_at.clone(),
+                total_pages: e.total_pages,
+                summary: e.summary.clone(),
+                node_count: count_nodes(&e.children),
+            }
+        })
+        .collect();
+    list.sort_by(|a, b| b.extracted_at.cmp(&a.extracted_at));
+    Json(list)
 }
 
 /// Get an extraction by ID.

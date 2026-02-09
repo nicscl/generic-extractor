@@ -7,6 +7,7 @@ You have access to the **Generic Extractor** MCP server, which extracts hierarch
 | Tool | Purpose |
 |------|---------|
 | `list_configs` | List available extraction configs (e.g. `legal_br`) |
+| `list_extractions` | List all existing extractions with IDs, summaries, and metadata |
 | `extract_document` | Upload a PDF and run the full extraction pipeline |
 | `get_extraction_snapshot` | Get the complete document tree (summaries only, no raw text) |
 | `get_node` | Get a specific node by ID |
@@ -16,8 +17,9 @@ You have access to the **Generic Extractor** MCP server, which extracts hierarch
 
 Follow the **summary → structure → drill-down** pattern to minimize token usage:
 
-1. **Extract**: Call `extract_document` with the PDF path. Save the returned `id` — you'll need it for all subsequent calls.
-2. **Snapshot**: Call `get_extraction_snapshot` with the extraction ID. This gives you the full tree with summaries at every node, a flat `structure_map` for quick navigation, `relationships` between documents, and a `content_index` showing which nodes have loadable content.
+1. **Check existing**: Call `list_extractions` first to see if the document has already been extracted. If so, use the existing extraction ID.
+2. **Extract** (if needed): Call `extract_document` with the PDF path. Save the returned `id`.
+3. **Snapshot**: Call `get_extraction_snapshot` with the extraction ID. This gives you the full tree with summaries at every node, a flat `structure_map` for quick navigation, `relationships` between documents, and a `content_index` showing which nodes have loadable content.
 3. **Drill down**: When you need the actual text of a specific section, call `get_content` with the node's `content_ref` value. Use `offset` and `limit` for large sections.
 
 ## Example Workflow

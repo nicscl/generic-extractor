@@ -42,6 +42,7 @@ This starts:
 | `/configs` | GET | List available extraction configs |
 | `/configs/:name` | GET | Get a specific config |
 | `/extract?config=legal_br&upload=true` | POST | Upload PDF (multipart `file` field), run extraction. `upload=true` persists to Supabase. |
+| `/extractions` | GET | List all extractions (lightweight summaries with IDs) |
 | `/extractions/:id/snapshot` | GET | Full extraction tree in one call (no raw content blobs, optimized for MCP/context loading) |
 | `/extractions/:id` | GET | Get extraction by ID |
 | `/extractions/:id/node/:node_id` | GET | Get specific node |
