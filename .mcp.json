@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "generic-extractor": {
+      "command": "node",
+      "args": ["/root/generic-extractor/mcp-server/dist/index.js"],
+      "env": {
+        "EXTRACTOR_API_URL": "http://localhost:3002"
+      }
+    }
+  }
+}
