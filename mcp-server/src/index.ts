@@ -57,9 +57,35 @@ function registerTools(server: McpServer) {
 
   server.tool(
     "extract_document",
-    "Upload a PDF file and run the extraction pipeline. Returns the full extraction result with ID, summary, structure map, and document tree.",
+    `Upload a PDF and run the extraction pipeline. Provide the file via exactly ONE of:
+- file_path: local filesystem path (for STDIO/local usage)
+- file_base64: base64-encoded PDF content (for remote HTTP usage)
+- file_url: URL to download the PDF from (for remote HTTP usage)
+Returns the full extraction result with ID, summary, structure map, and document tree.`,
     {
-      file_path: z.string().describe("Absolute path to the PDF file on disk"),
+      file_path: z
+        .string()
+        .optional()
+        .describe("Absolute path to the PDF file on disk (local mode)"),
+      file_base64: z
+        .string()
+        .optional()
+        .describe(
+          "Base64-encoded PDF file content (remote mode). Must also provide file_name.",
+        ),
+      file_url: z
+        .string()
+        .url()
+        .optional()
+        .describe(
+          "URL to download the PDF from (remote mode). The server will fetch it.",
+        ),
+      file_name: z
+        .string()
+        .optional()
+        .describe(
+          "Filename for the PDF (required with file_base64, optional with file_url). Example: 'document.pdf'",
+        ),
       config: z
         .string()
         .optional()
@@ -71,14 +97,85 @@ function registerTools(server: McpServer) {
         .default(true)
         .describe("Whether to persist the extraction to Supabase"),
     },
-    async ({ file_path, config, upload }) => {
-      const fileBuffer = await readFile(file_path);
-      const fileName = basename(file_path);
+    async ({ file_path, file_base64, file_url, file_name, config, upload }) => {
+      let fileBuffer: Uint8Array;
+      let fileName: string;
+
+      const sourceCount = [file_path, file_base64, file_url].filter(Boolean).length;
+      if (sourceCount === 0) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: "Error: Provide exactly one of file_path, file_base64, or file_url.",
+            },
+          ],
+          isError: true,
+        };
+      }
+      if (sourceCount > 1) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: "Error: Provide only ONE of file_path, file_base64, or file_url — not multiple.",
+            },
+          ],
+          isError: true,
+        };
+      }
+
+      if (file_path) {
+        // Local file
+        fileBuffer = new Uint8Array(await readFile(file_path));
+        fileName = file_name ?? basename(file_path);
+      } else if (file_base64) {
+        // Base64-encoded content
+        if (!file_name) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: "Error: file_name is required when using file_base64.",
+              },
+            ],
+            isError: true,
+          };
+        }
+        fileBuffer = new Uint8Array(Buffer.from(file_base64, "base64"));
+        fileName = file_name;
+      } else if (file_url) {
+        // Download from URL
+        const urlRes = await fetch(file_url);
+        if (!urlRes.ok) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: `Error: Failed to download file from URL (${urlRes.status}): ${await urlRes.text().catch(() => "")}`,
+              },
+            ],
+            isError: true,
+          };
+        }
+        fileBuffer = new Uint8Array(await urlRes.arrayBuffer());
+        // Derive filename from URL path or use provided name
+        fileName =
+          file_name ??
+          new URL(file_url).pathname.split("/").pop() ??
+          "document.pdf";
+      } else {
+        // Unreachable, but satisfy TypeScript
+        return {
+          content: [{ type: "text", text: "Error: No file source provided." }],
+          isError: true,
+        };
+      }
 
       const form = new FormData();
       form.append(
         "file",
-        new Blob([fileBuffer], { type: "application/pdf" }),
+        new Blob([fileBuffer as BlobPart], { type: "application/pdf" }),
         fileName,
       );
 

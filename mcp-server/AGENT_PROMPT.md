@@ -13,16 +13,43 @@ You have access to the **Generic Extractor** MCP server, which extracts hierarch
 | `get_node` | Get a specific node by ID |
 | `get_content` | Lazy-load the raw text content for a node (paginated) |
 
+## Uploading a PDF for Extraction
+
+`extract_document` accepts a PDF via **one** of three methods:
+
+| Parameter | When to use | Example |
+|-----------|-------------|---------|
+| `file_path` | Local agent with filesystem access (STDIO mode) | `"/home/user/case.pdf"` |
+| `file_url` | PDF is hosted at a URL (S3, public link, etc.) | `"https://bucket.s3.amazonaws.com/case.pdf"` |
+| `file_base64` | No URL, no filesystem — send raw content. Requires `file_name`. | `"JVBERi0xLjQK..."` |
+
+Choose **exactly one**. Examples:
+
+```json
+// Local file
+{ "file_path": "/path/to/document.pdf", "config": "legal_br", "upload": true }
+
+// URL download
+{ "file_url": "https://example.com/document.pdf", "config": "legal_br", "upload": true }
+
+// Base64 (must include file_name)
+{ "file_base64": "JVBERi0xLjQK...", "file_name": "document.pdf", "config": "legal_br", "upload": true }
+```
+
+Set `upload: true` (default) to persist the extraction in Supabase so it survives server restarts.
+
 ## How to Navigate an Extraction
 
 Follow the **summary → structure → drill-down** pattern to minimize token usage:
 
 1. **Check existing**: Call `list_extractions` first to see if the document has already been extracted. If so, use the existing extraction ID.
-2. **Extract** (if needed): Call `extract_document` with the PDF path. Save the returned `id`.
+2. **Extract** (if needed): Call `extract_document` with the PDF. Save the returned `id`.
 3. **Snapshot**: Call `get_extraction_snapshot` with the extraction ID. This gives you the full tree with summaries at every node, a flat `structure_map` for quick navigation, `relationships` between documents, and a `content_index` showing which nodes have loadable content.
-3. **Drill down**: When you need the actual text of a specific section, call `get_content` with the node's `content_ref` value. Use `offset` and `limit` for large sections.
+4. **Drill down**: When you need the actual text of a specific section, call `get_content` with the node's `content_ref` value. Use `offset` and `limit` for large sections.
 
-## Example Workflow
+## Example Workflows
+
+### Local agent (STDIO)
 
 ```
 User: "What are the defendant's main arguments in this case?"
@@ -36,6 +63,30 @@ User: "What are the defendant's main arguments in this case?"
 
 3. get_content({ ref: "content://contestacao_sec_merito", offset: 0, limit: 4000 })
    → Only if the summary wasn't detailed enough, load the actual text.
+```
+
+### Remote agent (HTTP) — PDF from a URL
+
+```
+User: "Analyze this contract: https://storage.example.com/contracts/2026/NDA-acme.pdf"
+
+1. extract_document({ file_url: "https://storage.example.com/contracts/2026/NDA-acme.pdf", config: "legal_br" })
+   → Server downloads the PDF and extracts it. Returns id: "ext_def456"
+
+2. get_extraction_snapshot({ extraction_id: "ext_def456" })
+   → Navigate the tree using summaries.
+```
+
+### Remote agent (HTTP) — PDF from user upload
+
+```
+User uploads a file via your UI → your app base64-encodes it
+
+1. extract_document({ file_base64: "<base64 string>", file_name: "contract.pdf", config: "legal_br" })
+   → Returns extraction with id: "ext_ghi789"
+
+2. get_extraction_snapshot({ extraction_id: "ext_ghi789" })
+   → Navigate as usual.
 ```
 
 ## Key Concepts

@@ -147,13 +147,15 @@ async fn get_config(
 struct ExtractQuery {
     config: Option<String>,
     upload: Option<bool>,
+    file_url: Option<String>,
 }
 
 /// Upload a document and extract its structure using Docling + LLM.
+/// Accepts either multipart file upload OR ?file_url= query parameter.
 async fn extract_document(
     State(state): State<AppState>,
     Query(query): Query<ExtractQuery>,
-    mut multipart: Multipart,
+    multipart: Option<Multipart>,
 ) -> Result<Json<Extraction>, (StatusCode, String)> {
     // Get the config
     let config_name = query.config.as_deref().unwrap_or("legal_br");
@@ -168,34 +170,85 @@ async fn extract_document(
         )
     })?;
 
-    // Read the uploaded file
-    let mut filename = String::new();
-    let mut file_data = Vec::new();
+    // Get file data from either multipart upload or URL download
+    let (filename, file_data) = if let Some(file_url) = &query.file_url {
+        // Download from URL
+        info!("Downloading file from URL: {}", file_url);
+        let resp = state.http_client.get(file_url).send().await.map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!("Failed to download file from URL: {}", e),
+            )
+        })?;
 
-    while let Some(field) = multipart
-        .next_field()
-        .await
-        .map_err(|e| (StatusCode::BAD_REQUEST, format!("Multipart error: {}", e)))?
-    {
-        if field.name() == Some("file") {
-            filename = field.file_name().unwrap_or("document").to_string();
-            file_data = field
-                .bytes()
-                .await
-                .map_err(|e| {
-                    (
-                        StatusCode::BAD_REQUEST,
-                        format!("Failed to read file: {}", e),
-                    )
-                })?
-                .to_vec();
-            break;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("URL download failed ({}): {}", status, text),
+            ));
         }
-    }
 
-    if file_data.is_empty() {
-        return Err((StatusCode::BAD_REQUEST, "No file uploaded".to_string()));
-    }
+        // Derive filename from URL path
+        let url_filename = file_url
+            .rsplit('/')
+            .next()
+            .and_then(|s| s.split('?').next())
+            .filter(|s| !s.is_empty())
+            .unwrap_or("document.pdf")
+            .to_string();
+
+        let data = resp.bytes().await.map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!("Failed to read URL response body: {}", e),
+            )
+        })?;
+
+        (url_filename, data.to_vec())
+    } else if let Some(mut multipart) = multipart {
+        // Multipart file upload
+        let mut filename = String::new();
+        let mut file_data = Vec::new();
+
+        while let Some(field) = multipart
+            .next_field()
+            .await
+            .map_err(|e| (StatusCode::BAD_REQUEST, format!("Multipart error: {}", e)))?
+        {
+            if field.name() == Some("file") {
+                filename = field.file_name().unwrap_or("document").to_string();
+                file_data = field
+                    .bytes()
+                    .await
+                    .map_err(|e| {
+                        (
+                            StatusCode::BAD_REQUEST,
+                            format!("Failed to read file: {}", e),
+                        )
+                    })?
+                    .to_vec();
+                break;
+            }
+        }
+
+        if file_data.is_empty() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "No file uploaded. Send multipart 'file' field or use ?file_url= parameter."
+                    .to_string(),
+            ));
+        }
+
+        (filename, file_data)
+    } else {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "No file provided. Send multipart 'file' field or use ?file_url= parameter."
+                .to_string(),
+        ));
+    };
 
     info!(
         "Received file: {} ({} bytes) with config: {}",
