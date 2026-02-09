@@ -57,11 +57,24 @@ fn is_leap_year(year: i32) -> bool {
     (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0)
 }
 
+/// Extraction processing status.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum ExtractionStatus {
+    Processing,
+    Completed,
+    Failed,
+}
+
 /// Root extraction result.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Extraction {
     pub id: String,
     pub version: u32,
+    pub status: ExtractionStatus,
+    /// Error message when status is "failed"
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
     /// Which config was used for this extraction
     #[serde(skip_serializing_if = "Option::is_none")]
     pub config_name: Option<String>,
@@ -92,6 +105,8 @@ impl Extraction {
         Self {
             id: format!("ext_{}", Uuid::new_v4().simple()),
             version: 1,
+            status: ExtractionStatus::Processing,
+            error: None,
             config_name,
             previous_version_id: None,
             content_hash: None,

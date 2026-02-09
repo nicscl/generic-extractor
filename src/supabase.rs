@@ -391,6 +391,8 @@ impl SupabaseClient {
         let extraction = Extraction {
             id: row.id,
             version: 1,
+            status: crate::schema::ExtractionStatus::Completed,
+            error: None,
             config_name: row.config_name,
             previous_version_id: None,
             content_hash: row.content_hash,

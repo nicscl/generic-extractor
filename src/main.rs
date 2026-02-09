@@ -18,7 +18,7 @@ use config::ConfigStore;
 use content_store::{ContentChunk, ContentStore};
 use extractor::{DoclingResponse, Extractor};
 use openrouter::OpenRouterClient;
-use schema::Extraction;
+use schema::{Extraction, ExtractionStatus};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 use tower_http::cors::CorsLayer;
@@ -150,10 +150,12 @@ struct ExtractQuery {
     config: Option<String>,
     upload: Option<bool>,
     file_url: Option<String>,
+    callback_url: Option<String>,
 }
 
-/// Upload a document and extract its structure using Docling + LLM.
-/// Accepts either multipart file upload OR ?file_url= query parameter.
+/// Upload a document and start async extraction using Docling + LLM.
+/// Returns immediately with extraction ID and status "processing".
+/// Poll GET /extractions/:id to check when status becomes "completed" or "failed".
 async fn extract_document(
     State(state): State<AppState>,
     Query(query): Query<ExtractQuery>,
@@ -259,81 +261,96 @@ async fn extract_document(
         config_name
     );
 
-    // Step 1: Call Docling sidecar for OCR + structure
-    let docling_response = call_docling_sidecar(&state.http_client, &filename, &file_data)
-        .await
-        .map_err(|e| {
-            error!("Docling conversion failed: {}", e);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Docling conversion failed: {}", e),
-            )
-        })?;
+    // Create a placeholder extraction with status "processing"
+    let extraction = Extraction::new(filename.clone(), Some(config_name.to_string()));
+    let extraction_id = extraction.id.clone();
 
-    info!(
-        "Docling extracted {} pages, {} chars markdown",
-        docling_response.total_pages,
-        docling_response.markdown.len()
-    );
-
-    // Debug: check pages content
-    let non_empty_pages = docling_response
-        .pages
-        .iter()
-        .filter(|p| !p.text.is_empty())
-        .count();
-    let total_page_chars: usize = docling_response.pages.iter().map(|p| p.text.len()).sum();
-    debug!(
-        "Pages array: {} items, {} non-empty, {} total chars",
-        docling_response.pages.len(),
-        non_empty_pages,
-        total_page_chars
-    );
-
-    // Step 2: Run LLM extraction with docling output
-    let extractor = Extractor::new((*state.openrouter).clone(), state.content_store.clone());
-
-    let extraction = extractor
-        .extract(&filename, &docling_response, config)
-        .await
-        .map_err(|e| {
-            error!("Extraction failed: {}", e);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Extraction failed: {}", e),
-            )
-        })?;
-
-    // Store extraction in memory
+    // Store the placeholder in memory
     {
         let mut extractions = state.extractions.write().unwrap();
         extractions.insert(extraction.id.clone(), extraction.clone());
     }
 
-    // Upload to Supabase if requested
-    if query.upload.unwrap_or(false) {
-        if let Some(ref supabase) = state.supabase {
-            supabase
-                .upload_extraction(&extraction, &state.content_store)
-                .await
-                .map_err(|e| {
-                    error!("Supabase upload failed: {}", e);
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("Supabase upload failed: {}", e),
-                    )
-                })?;
-            info!("Uploaded extraction {} to Supabase", extraction.id);
-        } else {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                "Supabase not configured. Set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY"
-                    .to_string(),
-            ));
-        }
-    }
+    info!("Queued extraction {} for async processing", extraction_id);
 
-    info!("Extraction complete: {}", extraction.id);
+    // Spawn background task to run the pipeline
+    let bg_state = state.clone();
+    let bg_config = config.clone();
+    let bg_upload = query.upload.unwrap_or(false);
+    let bg_callback_url = query.callback_url.clone();
+    let bg_id = extraction_id.clone();
+
+    tokio::spawn(async move {
+        // Step 1: Call Docling sidecar for OCR + structure
+        let docling_response = match call_docling_sidecar(&bg_state.http_client, &filename, &file_data).await {
+            Ok(resp) => resp,
+            Err(e) => {
+                error!("Docling conversion failed for {}: {}", bg_id, e);
+                let mut extractions = bg_state.extractions.write().unwrap();
+                if let Some(ext) = extractions.get_mut(&bg_id) {
+                    ext.status = ExtractionStatus::Failed;
+                    ext.error = Some(format!("Docling conversion failed: {}", e));
+                }
+                return;
+            }
+        };
+
+        info!(
+            "Docling extracted {} pages, {} chars markdown for {}",
+            docling_response.total_pages,
+            docling_response.markdown.len(),
+            bg_id
+        );
+
+        // Step 2: Run LLM extraction with docling output
+        let extractor = Extractor::new((*bg_state.openrouter).clone(), bg_state.content_store.clone());
+
+        let mut completed = match extractor.extract(&filename, &docling_response, &bg_config).await {
+            Ok(ext) => ext,
+            Err(e) => {
+                error!("LLM extraction failed for {}: {}", bg_id, e);
+                let mut extractions = bg_state.extractions.write().unwrap();
+                if let Some(ext) = extractions.get_mut(&bg_id) {
+                    ext.status = ExtractionStatus::Failed;
+                    ext.error = Some(format!("Extraction failed: {}", e));
+                }
+                return;
+            }
+        };
+
+        // Preserve the original ID (extractor.extract creates a new one)
+        completed.id = bg_id.clone();
+        completed.status = ExtractionStatus::Completed;
+
+        // Store completed extraction in memory
+        {
+            let mut extractions = bg_state.extractions.write().unwrap();
+            extractions.insert(bg_id.clone(), completed.clone());
+        }
+
+        // Upload to Supabase if requested
+        if bg_upload {
+            if let Some(ref supabase) = bg_state.supabase {
+                match supabase.upload_extraction(&completed, &bg_state.content_store).await {
+                    Ok(()) => info!("Uploaded extraction {} to Supabase", bg_id),
+                    Err(e) => error!("Supabase upload failed for {}: {}", bg_id, e),
+                }
+            }
+        }
+
+        // POST result to callback URL if provided
+        if let Some(ref url) = bg_callback_url {
+            info!("Sending callback for {} to {}", bg_id, url);
+            match bg_state.http_client.post(url).json(&completed).send().await {
+                Ok(resp) => info!("Callback for {} returned {}", bg_id, resp.status()),
+                Err(e) => error!("Callback for {} failed: {}", bg_id, e),
+            }
+        }
+
+        info!("Extraction complete: {}", bg_id);
+    });
+
+    // Return immediately with the placeholder
     Ok(Json(extraction))
 }
 
@@ -370,6 +387,7 @@ async fn call_docling_sidecar(
 #[derive(serde::Serialize)]
 struct ExtractionSummary {
     id: String,
+    status: ExtractionStatus,
     source_file: String,
     config_name: Option<String>,
     extracted_at: String,
@@ -430,6 +448,7 @@ async fn list_extractions(
             .values()
             .map(|e| ExtractionSummary {
                 id: e.id.clone(),
+                status: e.status.clone(),
                 source_file: e.source_file.clone(),
                 config_name: e.config_name.clone(),
                 extracted_at: e.extracted_at.clone(),
@@ -450,6 +469,7 @@ async fn list_extractions(
                     if !in_memory_ids.contains(&row.id) {
                         list.push(ExtractionSummary {
                             id: row.id,
+                            status: ExtractionStatus::Completed, // Supabase entries are always completed
                             source_file: row.source_file,
                             config_name: row.config_name,
                             extracted_at: row.extracted_at,
