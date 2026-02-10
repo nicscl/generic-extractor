@@ -12,6 +12,8 @@ __pycache__/
 docling-sidecar/.venv/
 docling-sidecar/*.egg-info/
 docling-sidecar/uv.lock
+smol-docling-sidecar/*.egg-info/
+smol-docling-sidecar/uv.lock
 
 # MCP server
 mcp-server/node_modules/
