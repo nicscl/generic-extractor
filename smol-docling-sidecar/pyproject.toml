@@ -1,0 +1,18 @@
+[project]
+name = "smol-docling-sidecar"
+version = "0.1.0"
+description = "SmolDocling PDF processing sidecar for generic-extractor (MLX)"
+requires-python = ">=3.10"
+dependencies = [
+    "mlx-vlm>=0.1.27,<0.2",
+    "pdf2image>=1.17.0",
+    "pillow>=10.0.0",
+    "docling-core>=2.0.0",
+    "fastapi>=0.115.0",
+    "uvicorn>=0.30.0",
+    "python-multipart>=0.0.9",
+]
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"

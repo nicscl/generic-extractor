@@ -102,6 +102,14 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    // SmolDocling is optional (only if SMOL_DOCLING_URL is set)
+    if let Some(provider) = ocr::smol_docling::SmolDoclingProvider::from_env(http_client.clone()) {
+        ocr_providers.insert(OcrProviderKind::SmolDocling, Arc::new(provider));
+        info!("OCR provider registered: smol_docling");
+    } else {
+        info!("OCR provider skipped: smol_docling (SMOL_DOCLING_URL not set)");
+    }
+
     // Build application state
     let state = AppState {
         extractions: Arc::new(RwLock::new(HashMap::new())),
@@ -209,7 +217,7 @@ async fn extract_document(
         (
             StatusCode::BAD_REQUEST,
             format!(
-                "Unknown ocr_provider: '{}'. Available: docling, mistral_ocr",
+                "Unknown ocr_provider: '{}'. Available: docling, mistral_ocr, smol_docling",
                 provider_name
             ),
         )

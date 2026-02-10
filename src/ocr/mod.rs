@@ -5,6 +5,7 @@
 
 pub mod docling;
 pub mod mistral;
+pub mod smol_docling;
 
 /// Per-page OCR output (always 1-indexed).
 #[derive(Debug, Clone)]
@@ -42,6 +43,7 @@ pub trait OcrProvider: Send + Sync {
 pub enum OcrProviderKind {
     Docling,
     MistralOcr,
+    SmolDocling,
 }
 
 impl OcrProviderKind {
@@ -50,6 +52,7 @@ impl OcrProviderKind {
         match s {
             "docling" => Some(Self::Docling),
             "mistral_ocr" => Some(Self::MistralOcr),
+            "smol_docling" => Some(Self::SmolDocling),
             _ => None,
         }
     }
