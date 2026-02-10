@@ -424,6 +424,8 @@ struct ExtractionSummary {
     extracted_at: String,
     total_pages: Option<u32>,
     summary: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    readable_id: Option<String>,
     node_count: usize,
 }
 
@@ -463,10 +465,17 @@ async fn get_or_hydrate_extraction(state: &AppState, id: &str) -> Option<Extract
     None
 }
 
+#[derive(Debug, serde::Deserialize)]
+struct ListExtractionsQuery {
+    /// Filter by readable_id (substring match, case-insensitive)
+    readable_id: Option<String>,
+}
+
 /// List all extractions (lightweight summaries).
 /// Merges in-memory extractions with Supabase if configured.
 async fn list_extractions(
     State(state): State<AppState>,
+    Query(query): Query<ListExtractionsQuery>,
 ) -> Json<Vec<ExtractionSummary>> {
     fn count_nodes(nodes: &[schema::DocumentNode]) -> usize {
         nodes.iter().map(|n| 1 + count_nodes(&n.children)).sum()
@@ -485,6 +494,7 @@ async fn list_extractions(
                 extracted_at: e.extracted_at.clone(),
                 total_pages: e.total_pages,
                 summary: e.summary.clone(),
+                readable_id: e.readable_id.clone(),
                 node_count: count_nodes(&e.children),
             })
             .collect()
@@ -506,6 +516,7 @@ async fn list_extractions(
                             extracted_at: row.extracted_at,
                             total_pages: row.total_pages,
                             summary: row.summary,
+                            readable_id: row.readable_id,
                             node_count: 0, // not hydrated yet
                         });
                     }
@@ -515,6 +526,17 @@ async fn list_extractions(
                 error!("Failed to list extractions from Supabase: {}", e);
             }
         }
+    }
+
+    // Filter by readable_id if provided (case-insensitive substring match)
+    if let Some(ref filter) = query.readable_id {
+        let filter_lower = filter.to_lowercase();
+        list.retain(|e| {
+            e.readable_id
+                .as_ref()
+                .map(|rid| rid.to_lowercase().contains(&filter_lower))
+                .unwrap_or(false)
+        });
     }
 
     list.sort_by(|a, b| b.extracted_at.cmp(&a.extracted_at));

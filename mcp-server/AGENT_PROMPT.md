@@ -7,7 +7,7 @@ You have access to the **Generic Extractor** MCP server, which extracts hierarch
 | Tool | Purpose |
 |------|---------|
 | `list_configs` | List available extraction configs (e.g. `legal_br`) |
-| `list_extractions` | List all existing extractions with IDs, summaries, and metadata |
+| `list_extractions` | List/search extractions by `readable_id` (case number, invoice ID, etc.) |
 | `extract_document` | Upload a PDF and run the full extraction pipeline |
 | `get_extraction_snapshot` | Get the complete document tree (summaries only, no raw text) |
 | `get_node` | Get a specific node by ID |
@@ -91,6 +91,9 @@ User uploads a file via your UI → your app base64-encodes it
 
 ## Key Concepts
 
+- **`readable_id`** — Human-readable document identifier extracted by the LLM (e.g. CNJ process number `0266175-44.2023.8.06.0001`, invoice number, contract ID). Present on each extraction. Use `list_extractions({ readable_id: "0266175" })` to search.
+- **`reference_index`** — Global entity cross-reference index at the extraction level. Maps entity types (CPF, CNPJ, PNR, flight numbers, monetary values, etc.) to their occurrences with node IDs. Use this to answer "which nodes mention CPF X?" without loading content.
+- **`metadata`** — Extraction-level structured metadata (e.g. case class, court, parties for legal docs). Node-level metadata also exists under each node's `metadata` field, with regex-extracted entities under `metadata._entities`.
 - **Nodes** have types like `PETICAO`, `DECISAO`, `RECURSO`, `CERTIDAO`, `DOCUMENTO`, `SECTION`, `GRUPO`.
 - **Relationships** connect nodes: `responds_to`, `references`, `decides_on`, `appeals`, `cites`, `amends`.
 - **content_ref** values look like `content://node_id`. Pass them to `get_content` to load text.
@@ -98,7 +101,9 @@ User uploads a file via your UI → your app base64-encodes it
 
 ## Guidelines
 
+- **Search first**: If you know a document identifier (case number, invoice ID), use `list_extractions({ readable_id: "..." })` to find existing extractions before uploading.
 - Always start with `get_extraction_snapshot` after extracting. Never skip straight to `get_content`.
+- **Use `reference_index`** to find which nodes contain a specific entity (CPF, CNPJ, PNR, etc.) without loading content.
 - Use summaries to decide what to drill into. Don't load all content — that defeats the purpose of the hierarchical structure.
 - For cross-reference questions ("How did the judge respond to X?"), check the `relationships` array in the snapshot to find connected nodes.
 - The `structure_map` in the snapshot is a flat index — useful for quickly locating nodes by label without traversing the tree.

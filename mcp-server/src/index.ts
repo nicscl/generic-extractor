@@ -45,10 +45,20 @@ function registerTools(server: McpServer) {
 
   server.tool(
     "list_extractions",
-    "List all available extractions with their IDs, source files, summaries, and page counts. Use this to find extraction IDs for get_extraction_snapshot.",
-    {},
-    async () => {
-      const extractions = await api("/extractions");
+    "List all available extractions with their IDs, source files, readable_id (human-readable document identifier like a case number or invoice ID), summaries, and page counts. Use this to find extraction IDs for get_extraction_snapshot. Supports filtering by readable_id.",
+    {
+      readable_id: z
+        .string()
+        .optional()
+        .describe(
+          "Filter by readable_id (case-insensitive substring match). Example: '0266175' to find a specific case.",
+        ),
+    },
+    async ({ readable_id }) => {
+      const params = new URLSearchParams();
+      if (readable_id) params.set("readable_id", readable_id);
+      const qs = params.toString();
+      const extractions = await api(`/extractions${qs ? `?${qs}` : ""}`);
       return {
         content: [{ type: "text", text: JSON.stringify(extractions, null, 2) }],
       };
@@ -196,7 +206,7 @@ Returns the full extraction result with ID, summary, structure map, and document
 
   server.tool(
     "get_extraction_snapshot",
-    "Get the full extraction tree for an extraction ID. Returns hierarchical structure with summaries, structure map, relationships, and content index — but no raw content blobs. Use get_content to lazy-load actual text.",
+    "Get the full extraction tree for an extraction ID. Returns hierarchical structure with summaries, readable_id, structure_map, relationships, reference_index (entity cross-references like CPFs, CNPJs, process numbers), metadata, and content index — but no raw content blobs. Use get_content to lazy-load actual text.",
     {
       extraction_id: z
         .string()
