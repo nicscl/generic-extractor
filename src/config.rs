@@ -25,6 +25,9 @@ pub struct ExtractionConfig {
     /// Regex-based entity patterns for extracting structured identifiers from OCR text.
     #[serde(default)]
     pub entity_patterns: Vec<EntityPattern>,
+    /// Hint for extracting a human-readable document identifier (e.g. case number, invoice ID).
+    #[serde(default)]
+    pub readable_id_hint: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -171,5 +174,6 @@ Return a JSON object with:
         relationship_types: vec!["references".to_string(), "contains".to_string()],
         metadata_schema: serde_json::json!({}),
         entity_patterns: Vec::new(),
+        readable_id_hint: None,
     }
 }

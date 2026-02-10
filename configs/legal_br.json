@@ -142,6 +142,7 @@
             }
         }
     },
+    "readable_id_hint": "número do processo (formato CNJ: NNNNNNN-DD.AAAA.J.TR.OOOO)",
     "entity_patterns": [
         {
             "id": "cpf",

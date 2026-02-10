@@ -79,6 +79,7 @@ impl SupabaseClient {
             "structure_map": extraction.structure_map,
             "metadata": extraction.metadata,
             "reference_index": reference_index,
+            "readable_id": extraction.readable_id,
             "extracted_at": extraction.extracted_at,
             "extractor_version": extraction.extractor_version,
         });
@@ -332,7 +333,7 @@ impl SupabaseClient {
 
     /// List all extractions (lightweight summaries).
     pub async fn list_extractions(&self) -> Result<Vec<ExtractionRow>> {
-        self.get_json("extractions?select=id,config_name,source_file,content_hash,total_pages,summary,structure_map,metadata,extracted_at,extractor_version&order=extracted_at.desc")
+        self.get_json("extractions?select=id,config_name,source_file,content_hash,total_pages,summary,structure_map,metadata,readable_id,extracted_at,extractor_version&order=extracted_at.desc")
             .await
     }
 
@@ -419,6 +420,7 @@ impl SupabaseClient {
             relationships,
             metadata: row.metadata.unwrap_or(serde_json::Value::Null),
             reference_index: row.reference_index.unwrap_or(serde_json::Value::Null),
+            readable_id: row.readable_id,
             children,
         };
 
@@ -471,6 +473,7 @@ pub struct ExtractionRow {
     pub structure_map: Option<Vec<StructureMapEntry>>,
     pub metadata: Option<serde_json::Value>,
     pub reference_index: Option<serde_json::Value>,
+    pub readable_id: Option<String>,
     pub extracted_at: String,
     pub extractor_version: Option<String>,
 }

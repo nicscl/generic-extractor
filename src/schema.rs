@@ -99,6 +99,9 @@ pub struct Extraction {
     /// Global reference index: entity type → occurrences with node IDs
     #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
     pub reference_index: serde_json::Value,
+    /// Human-readable document identifier (e.g. case number, invoice ID)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub readable_id: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub children: Vec<DocumentNode>,
 }
@@ -122,6 +125,7 @@ impl Extraction {
             relationships: Vec::new(),
             metadata: serde_json::Value::Null,
             reference_index: serde_json::Value::Null,
+            readable_id: None,
             children: Vec::new(),
         }
     }

@@ -60,14 +60,25 @@ impl Extractor {
             truncate_for_context(&ocr.markdown, 150000) // ~150K chars max
         );
 
-        let user_prompt = r#"Based on the document above, extract its hierarchical structure as JSON. Return ONLY valid JSON with this structure:
+        let readable_id_line = if let Some(hint) = &config.readable_id_hint {
+            format!(
+                r#"  "readable_id": "primary human-readable identifier — {}","#,
+                hint
+            )
+        } else {
+            r#"  "readable_id": "primary human-readable identifier (e.g. case number, invoice ID, contract number)","#.to_string()
+        };
 
-{
+        let user_prompt = format!(
+            r#"Based on the document above, extract its hierarchical structure as JSON. Return ONLY valid JSON with this structure:
+
+{{
   "summary": "2-4 sentence overview",
-  "structure_map": [{"id": "...", "label": "...", "children": ["id1", "id2"]}],
-  "metadata": {...},
+{}
+  "structure_map": [{{"id": "...", "label": "...", "children": ["id1", "id2"]}}],
+  "metadata": {{...}},
   "children": [
-    {
+    {{
       "id": "unique_id",
       "type": "DOCUMENT|PETICAO|DECISAO|RECURSO|SECTION|GROUP",
       "subtype": "Specific type if applicable",
@@ -77,12 +88,14 @@ impl Extractor {
       "author": "Author name if known",
       "summary": "2-4 sentence summary",
       "children": []
-    }
+    }}
   ],
   "relationships": [
-    {"from": "id1", "to": "id2", "type": "references|responds_to|decides_on|appeals"}
+    {{"from": "id1", "to": "id2", "type": "references|responds_to|decides_on|appeals"}}
   ]
-}"#;
+}}"#,
+            readable_id_line
+        );
 
         let messages = vec![Message::system(system_prompt), Message::user(user_prompt)];
 
@@ -117,6 +130,9 @@ impl Extractor {
 
         // Store metadata as-is
         extraction.metadata = extracted.metadata.unwrap_or(serde_json::Value::Null);
+
+        // Store readable_id from LLM
+        extraction.readable_id = extracted.readable_id;
 
         // Process children and populate content_ref with page-sliced OCR
         extraction.children =
@@ -233,6 +249,8 @@ struct ExtractedStructure {
     relationships: Vec<ExtractedRelationship>,
     #[serde(default)]
     metadata: Option<serde_json::Value>,
+    #[serde(default)]
+    readable_id: Option<String>,
     #[serde(default)]
     children: Vec<ExtractedNode>,
 }
