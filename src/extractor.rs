@@ -1,33 +1,16 @@
-//! Document extraction pipeline using LLM with Docling OCR.
+//! Document extraction pipeline using LLM with pluggable OCR providers.
 
 use crate::config::ExtractionConfig;
 use crate::content_store::ContentStore;
 use crate::entities::{self, CompiledPatterns};
+use crate::ocr::{OcrPage, OcrResult};
 use crate::openrouter::{Message, OpenRouterClient};
 use crate::schema::{
     ConfidenceScores, DocumentNode, EmbeddedReference, Extraction, Relationship, StructureMapEntry,
 };
 use anyhow::{Context, Result};
-use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tracing::{debug, info};
-
-/// Page-level OCR content from Docling.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PageContent {
-    pub page_num: u32,
-    pub text: String,
-}
-
-/// Response from Docling sidecar.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DoclingResponse {
-    pub markdown: String,
-    pub pages: Vec<PageContent>,
-    pub total_pages: u32,
-    #[serde(default)]
-    pub metadata: serde_json::Value,
-}
 
 /// Extraction pipeline orchestrator.
 pub struct Extractor {
@@ -43,26 +26,27 @@ impl Extractor {
         }
     }
 
-    /// Extract structure from a document using Docling OCR and LLM.
+    /// Extract structure from a document using OCR output and LLM.
     /// Uses token-cache-friendly prompt structure: document in system, instructions in user.
     pub async fn extract(
         &self,
         filename: &str,
-        docling: &DoclingResponse,
+        ocr: &OcrResult,
         config: &ExtractionConfig,
     ) -> Result<Extraction> {
         info!(
-            "Starting extraction for: {} ({} pages, {} chars) using config: {}",
+            "Starting extraction for: {} ({} pages, {} chars, provider={}) using config: {}",
             filename,
-            docling.total_pages,
-            docling.markdown.len(),
+            ocr.total_pages,
+            ocr.markdown.len(),
+            ocr.provider_name,
             config.name
         );
 
         // Compute content hash from the markdown
         let content_hash = {
             let mut hasher = Sha256::new();
-            hasher.update(docling.markdown.as_bytes());
+            hasher.update(ocr.markdown.as_bytes());
             format!("{:x}", hasher.finalize())
         };
 
@@ -72,8 +56,8 @@ impl Extractor {
         let system_prompt = format!(
             "{}\n\n--- DOCUMENT START (pages 1-{}) ---\n\n{}\n\n--- DOCUMENT END ---",
             config.prompts.structure,
-            docling.total_pages,
-            truncate_for_context(&docling.markdown, 150000) // ~150K chars max
+            ocr.total_pages,
+            truncate_for_context(&ocr.markdown, 150000) // ~150K chars max
         );
 
         let user_prompt = r#"Based on the document above, extract its hierarchical structure as JSON. Return ONLY valid JSON with this structure:
@@ -115,7 +99,7 @@ impl Extractor {
         // Build the Extraction object
         let mut extraction = Extraction::new(filename.to_string(), Some(config.name.clone()));
         extraction.content_hash = Some(content_hash);
-        extraction.total_pages = Some(docling.total_pages);
+        extraction.total_pages = Some(ocr.total_pages);
         extraction.summary = extracted.summary;
         extraction.structure_map = extracted.structure_map;
 
@@ -135,7 +119,8 @@ impl Extractor {
         extraction.metadata = extracted.metadata.unwrap_or(serde_json::Value::Null);
 
         // Process children and populate content_ref with page-sliced OCR
-        extraction.children = self.process_children(extracted.children, &docling.pages)?;
+        extraction.children =
+            self.process_children(extracted.children, &ocr.pages, ocr.ocr_confidence)?;
 
         // Run regex-based entity extraction if config has patterns
         if !config.entity_patterns.is_empty() {
@@ -179,7 +164,8 @@ impl Extractor {
     fn process_children(
         &self,
         nodes: Vec<ExtractedNode>,
-        pages: &[PageContent],
+        pages: &[OcrPage],
+        ocr_confidence: f64,
     ) -> Result<Vec<DocumentNode>> {
         let mut result = Vec::new();
 
@@ -197,7 +183,7 @@ impl Extractor {
             };
 
             // Recursively process children
-            let children = self.process_children(node.children, pages)?;
+            let children = self.process_children(node.children, pages, ocr_confidence)?;
 
             result.push(DocumentNode {
                 id: node.id,
@@ -220,7 +206,7 @@ impl Extractor {
                 referenced_by: Vec::new(),
                 content_ref,
                 confidence: Some(ConfidenceScores {
-                    ocr: Some(0.95), // Docling has high OCR confidence
+                    ocr: Some(ocr_confidence),
                     extraction: Some(0.8),
                     summary: Some(0.85),
                     low_confidence_regions: Vec::new(),
@@ -299,8 +285,8 @@ struct ExtractedRelationship {
 // Helper functions
 // ============================================================================
 
-/// Slice pages from Docling response for a given page range.
-fn slice_pages(pages: &[PageContent], range: [u32; 2]) -> String {
+/// Slice pages from OCR output for a given page range.
+fn slice_pages(pages: &[OcrPage], range: [u32; 2]) -> String {
     pages
         .iter()
         .filter(|p| p.page_num >= range[0] && p.page_num <= range[1])

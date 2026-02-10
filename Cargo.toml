@@ -26,6 +26,9 @@ base64 = "0.21"
 # Regex for entity extraction
 regex = "1"
 
+# Async trait
+async-trait = "0.1"
+
 # Utilities
 uuid = { version = "1", features = ["v4", "serde"] }
 sha2 = "0.10"

@@ -4,6 +4,7 @@ mod config;
 mod content_store;
 mod entities;
 mod extractor;
+mod ocr;
 mod openrouter;
 mod schema;
 mod supabase;
@@ -17,7 +18,8 @@ use axum::{
 };
 use config::ConfigStore;
 use content_store::{ContentChunk, ContentStore};
-use extractor::{DoclingResponse, Extractor};
+use extractor::Extractor;
+use ocr::{OcrInput, OcrProvider, OcrProviderKind};
 use openrouter::OpenRouterClient;
 use schema::{Extraction, ExtractionStatus};
 use std::collections::{HashMap, HashSet};
@@ -26,11 +28,6 @@ use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
 use tracing::{debug, error, info};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
-
-/// Docling sidecar URL (configurable via DOCLING_URL env var)
-fn docling_url() -> String {
-    std::env::var("DOCLING_URL").unwrap_or_else(|_| "http://localhost:3001".to_string())
-}
 
 /// Application state shared across handlers.
 #[derive(Clone)]
@@ -41,6 +38,7 @@ struct AppState {
     configs: Arc<ConfigStore>,
     http_client: reqwest::Client,
     supabase: Option<supabase::SupabaseClient>,
+    ocr_providers: Arc<HashMap<OcrProviderKind, Arc<dyn OcrProvider>>>,
 }
 
 #[tokio::main]
@@ -82,14 +80,37 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
+    // Initialize OCR providers
+    let http_client = reqwest::Client::new();
+    let mut ocr_providers: HashMap<OcrProviderKind, Arc<dyn OcrProvider>> = HashMap::new();
+
+    // Docling is always available
+    ocr_providers.insert(
+        OcrProviderKind::Docling,
+        Arc::new(ocr::docling::DoclingProvider::new(http_client.clone())),
+    );
+    info!("OCR provider registered: docling");
+
+    // Mistral OCR is optional (only if MISTRAL_API_KEY is set)
+    match ocr::mistral::MistralOcrProvider::from_env(http_client.clone()) {
+        Ok(provider) => {
+            ocr_providers.insert(OcrProviderKind::MistralOcr, Arc::new(provider));
+            info!("OCR provider registered: mistral_ocr");
+        }
+        Err(_) => {
+            info!("OCR provider skipped: mistral_ocr (MISTRAL_API_KEY not set)");
+        }
+    }
+
     // Build application state
     let state = AppState {
         extractions: Arc::new(RwLock::new(HashMap::new())),
         content_store: ContentStore::new(),
         openrouter: Arc::new(openrouter),
         configs: Arc::new(configs),
-        http_client: reqwest::Client::new(),
+        http_client,
         supabase,
+        ocr_providers: Arc::new(ocr_providers),
     };
 
     // Build router
@@ -113,7 +134,6 @@ async fn main() -> anyhow::Result<()> {
     let addr = format!("0.0.0.0:{}", port);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     info!("Server listening on http://{}", addr);
-    info!("Docling sidecar expected at {}", docling_url());
     axum::serve(listener, app).await?;
 
     Ok(())
@@ -152,11 +172,19 @@ struct ExtractQuery {
     upload: Option<bool>,
     file_url: Option<String>,
     callback_url: Option<String>,
+    ocr_provider: Option<String>,
 }
 
-/// Upload a document and start async extraction using Docling + LLM.
+/// Upload a document and start async extraction using OCR + LLM.
 /// Returns immediately with extraction ID and status "processing".
 /// Poll GET /extractions/:id to check when status becomes "completed" or "failed".
+///
+/// Query params:
+///   - `config` — extraction config name (default: `legal_br`)
+///   - `upload` — upload result to Supabase (default: false)
+///   - `file_url` — download file from this URL instead of multipart upload
+///   - `callback_url` — POST completed extraction to this URL
+///   - `ocr_provider` — `docling` (default) or `mistral_ocr`
 async fn extract_document(
     State(state): State<AppState>,
     Query(query): Query<ExtractQuery>,
@@ -175,26 +203,30 @@ async fn extract_document(
         )
     })?;
 
-    // Get file data from either multipart upload or URL download
-    let (filename, file_data) = if let Some(file_url) = &query.file_url {
-        // Download from URL
-        info!("Downloading file from URL: {}", file_url);
-        let resp = state.http_client.get(file_url).send().await.map_err(|e| {
-            (
-                StatusCode::BAD_REQUEST,
-                format!("Failed to download file from URL: {}", e),
-            )
-        })?;
+    // Resolve OCR provider
+    let provider_name = query.ocr_provider.as_deref().unwrap_or("docling");
+    let provider_kind = OcrProviderKind::from_str(provider_name).ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!(
+                "Unknown ocr_provider: '{}'. Available: docling, mistral_ocr",
+                provider_name
+            ),
+        )
+    })?;
+    let provider = state.ocr_providers.get(&provider_kind).ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!(
+                "OCR provider '{}' is not configured. Check env vars.",
+                provider_name
+            ),
+        )
+    })?;
+    let provider = Arc::clone(provider);
 
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
-            return Err((
-                StatusCode::BAD_REQUEST,
-                format!("URL download failed ({}): {}", status, text),
-            ));
-        }
-
+    // Build OCR input from either multipart upload or URL
+    let ocr_input = if let Some(file_url) = &query.file_url {
         // Derive filename from URL path
         let url_filename = file_url
             .rsplit('/')
@@ -204,14 +236,15 @@ async fn extract_document(
             .unwrap_or("document.pdf")
             .to_string();
 
-        let data = resp.bytes().await.map_err(|e| {
-            (
-                StatusCode::BAD_REQUEST,
-                format!("Failed to read URL response body: {}", e),
-            )
-        })?;
+        info!(
+            "Received file_url: {} (ocr_provider={})",
+            file_url, provider_name
+        );
 
-        (url_filename, data.to_vec())
+        OcrInput::Url {
+            filename: url_filename,
+            url: file_url.clone(),
+        }
     } else if let Some(mut multipart) = multipart {
         // Multipart file upload
         let mut filename = String::new();
@@ -246,7 +279,17 @@ async fn extract_document(
             ));
         }
 
-        (filename, file_data)
+        info!(
+            "Received file: {} ({} bytes, ocr_provider={})",
+            filename,
+            file_data.len(),
+            provider_name
+        );
+
+        OcrInput::Bytes {
+            filename,
+            data: file_data,
+        }
     } else {
         return Err((
             StatusCode::BAD_REQUEST,
@@ -255,15 +298,12 @@ async fn extract_document(
         ));
     };
 
-    info!(
-        "Received file: {} ({} bytes) with config: {}",
-        filename,
-        file_data.len(),
-        config_name
-    );
+    let filename_for_log = match &ocr_input {
+        OcrInput::Bytes { filename, .. } | OcrInput::Url { filename, .. } => filename.clone(),
+    };
 
     // Create a placeholder extraction with status "processing"
-    let extraction = Extraction::new(filename.clone(), Some(config_name.to_string()));
+    let extraction = Extraction::new(filename_for_log.clone(), Some(config_name.to_string()));
     let extraction_id = extraction.id.clone();
 
     // Store the placeholder in memory
@@ -277,47 +317,50 @@ async fn extract_document(
     // Spawn background task to run the pipeline
     let bg_state = state.clone();
     let bg_config = config.clone();
-    let bg_upload = query.upload.unwrap_or(false);
+    let bg_upload = query.upload.unwrap_or(true);
     let bg_callback_url = query.callback_url.clone();
     let bg_id = extraction_id.clone();
 
     tokio::spawn(async move {
-        // Step 1: Call Docling sidecar for OCR + structure
-        let docling_response = match call_docling_sidecar(&bg_state.http_client, &filename, &file_data).await {
-            Ok(resp) => resp,
+        // Step 1: Run OCR via the selected provider
+        let ocr_result = match provider.process(&ocr_input).await {
+            Ok(result) => result,
             Err(e) => {
-                error!("Docling conversion failed for {}: {}", bg_id, e);
+                error!("OCR ({}) failed for {}: {}", provider.name(), bg_id, e);
                 let mut extractions = bg_state.extractions.write().unwrap();
                 if let Some(ext) = extractions.get_mut(&bg_id) {
                     ext.status = ExtractionStatus::Failed;
-                    ext.error = Some(format!("Docling conversion failed: {}", e));
+                    ext.error = Some(format!("OCR ({}) failed: {}", provider.name(), e));
                 }
                 return;
             }
         };
 
         info!(
-            "Docling extracted {} pages, {} chars markdown for {}",
-            docling_response.total_pages,
-            docling_response.markdown.len(),
+            "{} extracted {} pages, {} chars markdown for {}",
+            ocr_result.provider_name,
+            ocr_result.total_pages,
+            ocr_result.markdown.len(),
             bg_id
         );
 
-        // Step 2: Run LLM extraction with docling output
-        let extractor = Extractor::new((*bg_state.openrouter).clone(), bg_state.content_store.clone());
+        // Step 2: Run LLM extraction with OCR output
+        let extractor =
+            Extractor::new((*bg_state.openrouter).clone(), bg_state.content_store.clone());
 
-        let mut completed = match extractor.extract(&filename, &docling_response, &bg_config).await {
-            Ok(ext) => ext,
-            Err(e) => {
-                error!("LLM extraction failed for {}: {}", bg_id, e);
-                let mut extractions = bg_state.extractions.write().unwrap();
-                if let Some(ext) = extractions.get_mut(&bg_id) {
-                    ext.status = ExtractionStatus::Failed;
-                    ext.error = Some(format!("Extraction failed: {}", e));
+        let mut completed =
+            match extractor.extract(&filename_for_log, &ocr_result, &bg_config).await {
+                Ok(ext) => ext,
+                Err(e) => {
+                    error!("LLM extraction failed for {}: {}", bg_id, e);
+                    let mut extractions = bg_state.extractions.write().unwrap();
+                    if let Some(ext) = extractions.get_mut(&bg_id) {
+                        ext.status = ExtractionStatus::Failed;
+                        ext.error = Some(format!("Extraction failed: {}", e));
+                    }
+                    return;
                 }
-                return;
-            }
-        };
+            };
 
         // Preserve the original ID (extractor.extract creates a new one)
         completed.id = bg_id.clone();
@@ -332,7 +375,10 @@ async fn extract_document(
         // Upload to Supabase if requested
         if bg_upload {
             if let Some(ref supabase) = bg_state.supabase {
-                match supabase.upload_extraction(&completed, &bg_state.content_store).await {
+                match supabase
+                    .upload_extraction(&completed, &bg_state.content_store)
+                    .await
+                {
                     Ok(()) => info!("Uploaded extraction {} to Supabase", bg_id),
                     Err(e) => error!("Supabase upload failed for {}: {}", bg_id, e),
                 }
@@ -342,7 +388,13 @@ async fn extract_document(
         // POST result to callback URL if provided
         if let Some(ref url) = bg_callback_url {
             info!("Sending callback for {} to {}", bg_id, url);
-            match bg_state.http_client.post(url).json(&completed).send().await {
+            match bg_state
+                .http_client
+                .post(url)
+                .json(&completed)
+                .send()
+                .await
+            {
                 Ok(resp) => info!("Callback for {} returned {}", bg_id, resp.status()),
                 Err(e) => error!("Callback for {} failed: {}", bg_id, e),
             }
@@ -353,36 +405,6 @@ async fn extract_document(
 
     // Return immediately with the placeholder
     Ok(Json(extraction))
-}
-
-/// Call the Docling sidecar to convert a PDF.
-async fn call_docling_sidecar(
-    client: &reqwest::Client,
-    filename: &str,
-    file_data: &[u8],
-) -> anyhow::Result<DoclingResponse> {
-    use reqwest::multipart::{Form, Part};
-
-    let part = Part::bytes(file_data.to_vec())
-        .file_name(filename.to_string())
-        .mime_str("application/pdf")?;
-
-    let form = Form::new().part("file", part);
-
-    let response = client
-        .post(format!("{}/convert", docling_url()))
-        .multipart(form)
-        .send()
-        .await?;
-
-    if !response.status().is_success() {
-        let status = response.status();
-        let error_text = response.text().await.unwrap_or_default();
-        anyhow::bail!("Docling sidecar error ({}): {}", status, error_text);
-    }
-
-    let docling: DoclingResponse = response.json().await?;
-    Ok(docling)
 }
 
 #[derive(serde::Serialize)]

@@ -178,7 +178,7 @@ impl SupabaseClient {
             "author": node.author,
             "summary": node.summary,
             "confidence": node.confidence,
-            "metadata": metadata,
+            "node_metadata": metadata,
         });
 
         let resp = self
