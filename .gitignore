@@ -15,6 +15,9 @@ docling-sidecar/uv.lock
 smol-docling-sidecar/*.egg-info/
 smol-docling-sidecar/uv.lock
 
+# GCE service account keys
+*-key.json
+
 # Dataset persistence
 data/
 

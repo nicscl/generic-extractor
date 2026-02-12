@@ -7,12 +7,12 @@
 set -euo pipefail
 
 PROJECT="${GCE_PROJECT_ID:?Set GCE_PROJECT_ID}"
-ZONE="us-central1-a"
+ZONE="${GCE_ZONE:-us-east1-d}"
 INSTANCE="docling-gpu"
 MACHINE="n1-standard-4"
 GPU="type=nvidia-tesla-t4,count=1"
-DISK_SIZE="80GB"
-IMAGE_FAMILY="common-cu124-debian-11-py310"   # Deep Learning VM with CUDA 12.4
+DISK_SIZE="100GB"
+IMAGE_FAMILY="common-cu128-ubuntu-2204-nvidia-570"  # Deep Learning VM Ubuntu 22.04, CUDA 12.8
 IMAGE_PROJECT="deeplearning-platform-release"
 STATIC_IP_NAME="docling-ip"
 REGION="${ZONE%-*}"                             # us-central1
@@ -43,8 +43,13 @@ gcloud compute instances create "$INSTANCE" \
     --tags=docling-server \
     --metadata=install-nvidia-driver=True \
     --scopes=default \
-    --no-restart-on-failure \
-    --no-start-on-create
+    --no-restart-on-failure
+
+echo "==> Stopping instance (we want it created but not running)..."
+gcloud compute instances stop "$INSTANCE" \
+    --project="$PROJECT" \
+    --zone="$ZONE" \
+    --quiet
 
 echo ""
 echo "Done. Instance '$INSTANCE' created (TERMINATED)."
