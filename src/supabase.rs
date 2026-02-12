@@ -2,13 +2,14 @@
 
 use anyhow::{anyhow, Result};
 use reqwest::Client;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::json;
 use tracing::{debug, info};
 
 use crate::schema::{
-    ConfidenceScores, DocumentNode, Extraction, Relationship, StructureMapEntry,
+    ConfidenceScores, DocumentNode, Extraction, ExtractionStatus, Relationship, StructureMapEntry,
 };
+use crate::sheet_schema::{ColumnDef, DataSchema, SchemaRelationship, SheetExtraction};
 
 /// Supabase client configuration.
 #[derive(Clone)]
@@ -456,6 +457,228 @@ impl SupabaseClient {
 
         Ok(rows.into_iter().next().map(|r| r.content))
     }
+
+    // ========================================================================
+    // Dataset methods (sheet extraction persistence)
+    // ========================================================================
+
+    /// Upload a sheet extraction (dataset) to Supabase.
+    pub async fn upload_dataset(&self, dataset: &SheetExtraction) -> Result<()> {
+        info!("Uploading dataset {} to Supabase", dataset.id);
+
+        // 1. Build schemas JSONB (column defs only, no rows)
+        let schemas_json: Vec<serde_json::Value> = dataset
+            .schemas
+            .iter()
+            .map(|s| {
+                json!({
+                    "name": s.name,
+                    "description": s.description,
+                    "columns": s.columns,
+                    "row_count": s.row_count,
+                })
+            })
+            .collect();
+
+        let relationships_json: serde_json::Value = serde_json::to_value(&dataset.relationships)?;
+
+        // 2. Insert main dataset record
+        let url = format!("{}/rest/v1/datasets", self.base_url);
+        let body = json!({
+            "id": dataset.id,
+            "source_file": dataset.source_file,
+            "config_name": dataset.config_name,
+            "extracted_at": dataset.extracted_at,
+            "summary": dataset.summary,
+            "schemas": schemas_json,
+            "relationships": relationships_json,
+            "status": "completed",
+        });
+
+        let resp = self
+            .client
+            .post(&url)
+            .header("apikey", &self.service_role_key)
+            .header("Authorization", format!("Bearer {}", self.service_role_key))
+            .header("Content-Type", "application/json")
+            .header("Content-Profile", "extraction")
+            .header("Prefer", "return=minimal")
+            .json(&body)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            return Err(anyhow!(
+                "Failed to insert dataset: {} - {}",
+                status,
+                text
+            ));
+        }
+
+        // 3. Batch insert rows into dataset_rows (100 per batch)
+        let rows_url = format!("{}/rest/v1/dataset_rows", self.base_url);
+        let mut total_inserted = 0usize;
+
+        for schema in &dataset.schemas {
+            let mut batch: Vec<serde_json::Value> = Vec::with_capacity(100);
+
+            for (row_idx, row_data) in schema.rows.iter().enumerate() {
+                batch.push(json!({
+                    "id": format!("dsr_{}", uuid::Uuid::new_v4().simple()),
+                    "dataset_id": dataset.id,
+                    "schema_name": schema.name,
+                    "row_data": row_data,
+                    "row_index": row_idx,
+                }));
+
+                if batch.len() >= 100 {
+                    self.post_batch(&rows_url, &batch).await?;
+                    total_inserted += batch.len();
+                    info!(
+                        "Inserted {} rows for dataset {} schema '{}'",
+                        total_inserted, dataset.id, schema.name
+                    );
+                    batch.clear();
+                }
+            }
+
+            // Flush remaining
+            if !batch.is_empty() {
+                self.post_batch(&rows_url, &batch).await?;
+                total_inserted += batch.len();
+            }
+        }
+
+        info!(
+            "Successfully uploaded dataset {} to Supabase ({} rows)",
+            dataset.id, total_inserted
+        );
+        Ok(())
+    }
+
+    /// POST a batch of JSON objects.
+    async fn post_batch(&self, url: &str, batch: &[serde_json::Value]) -> Result<()> {
+        let resp = self
+            .client
+            .post(url)
+            .header("apikey", &self.service_role_key)
+            .header("Authorization", format!("Bearer {}", self.service_role_key))
+            .header("Content-Type", "application/json")
+            .header("Content-Profile", "extraction")
+            .header("Prefer", "return=minimal")
+            .json(batch)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            return Err(anyhow!("Failed to insert batch: {} - {}", status, text));
+        }
+        Ok(())
+    }
+
+    /// List all datasets (lightweight summaries).
+    pub async fn list_datasets(&self) -> Result<Vec<DatasetRow>> {
+        self.get_json("datasets?select=id,source_file,config_name,extracted_at,summary,status,schemas&order=extracted_at.desc")
+            .await
+    }
+
+    /// Fetch a full dataset by ID, reconstructing from Supabase tables.
+    pub async fn fetch_dataset(&self, id: &str) -> Result<Option<SheetExtraction>> {
+        // 1. Fetch main record
+        let rows: Vec<DatasetRow> = self
+            .get_json(&format!("datasets?id=eq.{}&select=*", id))
+            .await?;
+
+        let row = match rows.into_iter().next() {
+            Some(r) => r,
+            None => return Ok(None),
+        };
+
+        // 2. Fetch all dataset rows
+        let data_rows: Vec<DatasetRowEntry> = self
+            .get_json(&format!(
+                "dataset_rows?dataset_id=eq.{}&select=*&order=row_index",
+                id
+            ))
+            .await?;
+
+        // 3. Reconstruct schemas by merging column defs from JSONB + rows
+        let schema_defs: Vec<DatasetSchemaJson> =
+            serde_json::from_value(row.schemas.clone()).unwrap_or_default();
+
+        let mut schemas: Vec<DataSchema> = schema_defs
+            .into_iter()
+            .map(|s| {
+                let rows_for_schema: Vec<serde_json::Value> = data_rows
+                    .iter()
+                    .filter(|r| r.schema_name == s.name)
+                    .map(|r| r.row_data.clone())
+                    .collect();
+
+                let row_count = rows_for_schema.len();
+                DataSchema {
+                    name: s.name,
+                    description: s.description,
+                    columns: s.columns,
+                    row_count,
+                    rows: rows_for_schema,
+                }
+            })
+            .collect();
+
+        // Update row_count based on actual rows
+        for schema in &mut schemas {
+            schema.row_count = schema.rows.len();
+        }
+
+        let relationships: Vec<SchemaRelationship> = row
+            .relationships
+            .as_ref()
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .unwrap_or_default();
+
+        let dataset = SheetExtraction {
+            id: row.id,
+            status: ExtractionStatus::Completed,
+            error: None,
+            config_name: row.config_name,
+            source_file: row.source_file,
+            extracted_at: row.extracted_at,
+            summary: row.summary,
+            schemas,
+            relationships,
+        };
+
+        info!(
+            "Hydrated dataset {} from Supabase ({} rows)",
+            dataset.id,
+            data_rows.len()
+        );
+
+        Ok(Some(dataset))
+    }
+
+    /// Query rows from a specific schema within a dataset (paginated).
+    pub async fn query_dataset_rows(
+        &self,
+        dataset_id: &str,
+        schema_name: &str,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Vec<serde_json::Value>> {
+        let rows: Vec<DatasetRowEntry> = self
+            .get_json(&format!(
+                "dataset_rows?dataset_id=eq.{}&schema_name=eq.{}&select=row_data&order=row_index&offset={}&limit={}",
+                dataset_id, schema_name, offset, limit
+            ))
+            .await?;
+
+        Ok(rows.into_iter().map(|r| r.row_data).collect())
+    }
 }
 
 // ============================================================================
@@ -507,6 +730,51 @@ struct RelationshipRow {
     from_node: String,
     to_node: String,
     relationship_type: String,
+}
+
+// ============================================================================
+// Dataset row types
+// ============================================================================
+
+#[derive(Debug, Deserialize)]
+pub struct DatasetRow {
+    pub id: String,
+    pub source_file: String,
+    pub config_name: Option<String>,
+    pub extracted_at: String,
+    pub summary: String,
+    pub schemas: serde_json::Value,
+    pub relationships: Option<serde_json::Value>,
+    pub status: Option<String>,
+}
+
+/// Schema definition as stored in the JSONB `schemas` column.
+#[derive(Debug, Deserialize)]
+struct DatasetSchemaJson {
+    name: String,
+    description: String,
+    #[serde(default)]
+    columns: Vec<ColumnDef>,
+    #[allow(dead_code)]
+    #[serde(default)]
+    row_count: usize,
+}
+
+/// A single row entry from `dataset_rows` table.
+#[derive(Debug, Deserialize)]
+struct DatasetRowEntry {
+    #[allow(dead_code)]
+    #[serde(default)]
+    id: Option<String>,
+    #[allow(dead_code)]
+    #[serde(default)]
+    dataset_id: Option<String>,
+    #[serde(default)]
+    schema_name: String,
+    row_data: serde_json::Value,
+    #[allow(dead_code)]
+    #[serde(default)]
+    row_index: Option<i64>,
 }
 
 /// Build a nested tree from flat node rows.

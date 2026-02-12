@@ -145,6 +145,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/extract-sheet", post(extract_sheet))
         .route("/datasets", get(list_datasets))
         .route("/datasets/:id", get(get_dataset))
+        .route("/datasets/:id/rows", get(get_dataset_rows))
         .layer(DefaultBodyLimit::max(100 * 1024 * 1024)) // 100MB
         .layer(TraceLayer::new_for_http())
         .layer(CorsLayer::permissive())
@@ -643,6 +644,7 @@ async fn get_content(
 #[derive(serde::Deserialize)]
 struct SheetExtractQuery {
     config: Option<String>,
+    upload: Option<bool>,
     ocr_provider: Option<String>,
 }
 
@@ -724,6 +726,7 @@ async fn extract_sheet(
     // Spawn background task
     let bg_state = state.clone();
     let bg_config = config.clone();
+    let bg_upload = query.upload.unwrap_or(true);
     let bg_id = dataset_id.clone();
 
     tokio::spawn(async move {
@@ -826,6 +829,16 @@ async fn extract_sheet(
             error!("Failed to persist dataset {} to disk: {}", bg_id, e);
         }
 
+        // Upload to Supabase if requested
+        if bg_upload {
+            if let Some(ref supabase) = bg_state.supabase {
+                match supabase.upload_dataset(&completed).await {
+                    Ok(()) => info!("Uploaded dataset {} to Supabase", bg_id),
+                    Err(e) => error!("Supabase upload failed for dataset {}: {}", bg_id, e),
+                }
+            }
+        }
+
         {
             let mut datasets = bg_state.datasets.write().unwrap();
             datasets.insert(bg_id.clone(), completed);
@@ -849,37 +862,183 @@ struct DatasetSummary {
     total_rows: usize,
 }
 
+/// Try to get a dataset from memory, falling back to Supabase if configured.
+/// Caches hydrated datasets in memory for subsequent requests.
+async fn get_or_hydrate_dataset(state: &AppState, id: &str) -> Option<SheetExtraction> {
+    // 1. Check in-memory cache
+    {
+        let datasets = state.datasets.read().unwrap();
+        if let Some(dataset) = datasets.get(id) {
+            return Some(dataset.clone());
+        }
+    }
+
+    // 2. Fall back to Supabase
+    if let Some(ref supabase) = state.supabase {
+        match supabase.fetch_dataset(id).await {
+            Ok(Some(dataset)) => {
+                let mut datasets = state.datasets.write().unwrap();
+                datasets.insert(dataset.id.clone(), dataset.clone());
+                info!("Hydrated dataset {} from Supabase into cache", id);
+                return Some(dataset);
+            }
+            Ok(None) => {
+                debug!("Dataset {} not found in Supabase", id);
+            }
+            Err(e) => {
+                error!("Failed to fetch dataset {} from Supabase: {}", id, e);
+            }
+        }
+    }
+
+    None
+}
+
 /// List all datasets (lightweight summaries).
+/// Merges in-memory datasets with Supabase if configured.
 async fn list_datasets(State(state): State<AppState>) -> Json<Vec<DatasetSummary>> {
-    let datasets = state.datasets.read().unwrap();
-    let mut list: Vec<DatasetSummary> = datasets
-        .values()
-        .map(|d| DatasetSummary {
-            id: d.id.clone(),
-            status: d.status.clone(),
-            source_file: d.source_file.clone(),
-            config_name: d.config_name.clone(),
-            extracted_at: d.extracted_at.clone(),
-            summary: d.summary.clone(),
-            schema_count: d.schemas.len(),
-            total_rows: d.schemas.iter().map(|s| s.row_count).sum(),
-        })
-        .collect();
+    // Collect in-memory datasets
+    let mut list: Vec<DatasetSummary> = {
+        let datasets = state.datasets.read().unwrap();
+        datasets
+            .values()
+            .map(|d| DatasetSummary {
+                id: d.id.clone(),
+                status: d.status.clone(),
+                source_file: d.source_file.clone(),
+                config_name: d.config_name.clone(),
+                extracted_at: d.extracted_at.clone(),
+                summary: d.summary.clone(),
+                schema_count: d.schemas.len(),
+                total_rows: d.schemas.iter().map(|s| s.row_count).sum(),
+            })
+            .collect()
+    };
+
+    // Merge Supabase datasets (dedup by ID)
+    if let Some(ref supabase) = state.supabase {
+        match supabase.list_datasets().await {
+            Ok(rows) => {
+                let in_memory_ids: HashSet<String> =
+                    list.iter().map(|d| d.id.clone()).collect();
+                for row in rows {
+                    if !in_memory_ids.contains(&row.id) {
+                        // Parse schema count from JSONB
+                        let schema_count = row
+                            .schemas
+                            .as_array()
+                            .map(|a| a.len())
+                            .unwrap_or(0);
+                        let total_rows: usize = row
+                            .schemas
+                            .as_array()
+                            .map(|arr| {
+                                arr.iter()
+                                    .filter_map(|s| s.get("row_count").and_then(|v| v.as_u64()))
+                                    .sum::<u64>() as usize
+                            })
+                            .unwrap_or(0);
+
+                        list.push(DatasetSummary {
+                            id: row.id,
+                            status: ExtractionStatus::Completed,
+                            source_file: row.source_file,
+                            config_name: row.config_name,
+                            extracted_at: row.extracted_at,
+                            summary: row.summary,
+                            schema_count,
+                            total_rows,
+                        });
+                    }
+                }
+            }
+            Err(e) => {
+                error!("Failed to list datasets from Supabase: {}", e);
+            }
+        }
+    }
+
     list.sort_by(|a, b| b.extracted_at.cmp(&a.extracted_at));
     Json(list)
 }
 
-/// Get a dataset by ID.
+/// Get a dataset by ID (in-memory + Supabase fallback).
 async fn get_dataset(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<SheetExtraction>, StatusCode> {
-    let datasets = state.datasets.read().unwrap();
-    datasets
-        .get(&id)
-        .cloned()
+    get_or_hydrate_dataset(&state, &id)
+        .await
         .map(Json)
         .ok_or(StatusCode::NOT_FOUND)
+}
+
+#[derive(serde::Deserialize)]
+struct DatasetRowsQuery {
+    schema_name: Option<String>,
+    offset: Option<usize>,
+    limit: Option<usize>,
+}
+
+/// Query rows from a specific schema within a dataset (paginated).
+/// GET /datasets/:id/rows?schema_name=...&offset=0&limit=100
+async fn get_dataset_rows(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(query): Query<DatasetRowsQuery>,
+) -> Result<Json<Vec<serde_json::Value>>, (StatusCode, String)> {
+    let schema_name = query.schema_name.as_deref().unwrap_or("");
+    let offset = query.offset.unwrap_or(0);
+    let limit = query.limit.unwrap_or(100);
+
+    if schema_name.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "schema_name query parameter is required".to_string(),
+        ));
+    }
+
+    // 1. Try in-memory
+    {
+        let datasets = state.datasets.read().unwrap();
+        if let Some(dataset) = datasets.get(&id) {
+            if let Some(schema) = dataset.schemas.iter().find(|s| s.name == schema_name) {
+                let rows: Vec<serde_json::Value> = schema
+                    .rows
+                    .iter()
+                    .skip(offset)
+                    .take(limit)
+                    .cloned()
+                    .collect();
+                return Ok(Json(rows));
+            }
+            return Err((
+                StatusCode::NOT_FOUND,
+                format!("Schema '{}' not found in dataset", schema_name),
+            ));
+        }
+    }
+
+    // 2. Fall back to Supabase
+    if let Some(ref supabase) = state.supabase {
+        match supabase
+            .query_dataset_rows(&id, schema_name, offset, limit)
+            .await
+        {
+            Ok(rows) => return Ok(Json(rows)),
+            Err(e) => {
+                error!(
+                    "Failed to query dataset rows from Supabase: {}",
+                    e
+                );
+            }
+        }
+    }
+
+    Err((
+        StatusCode::NOT_FOUND,
+        format!("Dataset {} not found", id),
+    ))
 }
 
 // ============================================================================
