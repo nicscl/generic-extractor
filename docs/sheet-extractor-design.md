@@ -107,20 +107,20 @@ The LLM agent picks from this menu when defining column transforms. This is:
 
 If edge cases arise later that need custom logic, a Python escape hatch can be added.
 
-### 5. JSONB storage (initial), with upgrade path
+### 5. JSONB storage with Supabase persistence
 
-**Initial storage:** Fixed `extraction.datasets` table with JSONB columns.
+**Status: Implemented.** Datasets are stored in two Supabase tables within the `extraction` schema:
 
 ```sql
 CREATE TABLE extraction.datasets (
     id TEXT PRIMARY KEY,
-    extraction_id TEXT REFERENCES extraction.extractions(id),
     source_file TEXT NOT NULL,
     config_name TEXT,
     extracted_at TIMESTAMPTZ DEFAULT NOW(),
-    schemas JSONB NOT NULL,        -- array of schema definitions
+    summary TEXT,
+    schemas JSONB NOT NULL,         -- array of schema definitions (columns only, no rows)
     relationships JSONB,            -- cross-schema relationships
-    summary TEXT                     -- LLM-generated overview
+    status TEXT DEFAULT 'processing'
 );
 
 CREATE TABLE extraction.dataset_rows (
@@ -131,12 +131,24 @@ CREATE TABLE extraction.dataset_rows (
     page_num INTEGER,                -- source page (for scanned PDFs)
     row_index INTEGER                -- original row position
 );
+
+CREATE INDEX idx_dataset_rows_dataset ON extraction.dataset_rows(dataset_id);
+CREATE INDEX idx_dataset_rows_schema ON extraction.dataset_rows(dataset_id, schema_name);
 ```
+
+Migration file: `migrations/003_datasets.sql`
+
+**Persistence strategy:**
+- File-based backup: datasets always saved to `data/datasets/{id}.json`
+- Supabase upload: when `upload=true` (default), rows batch-inserted 100 at a time
+- Hydration: on cache miss, `get_or_hydrate_dataset()` fetches from Supabase and caches in memory
+- Listing: merges in-memory + Supabase datasets (dedup by ID)
 
 This supports:
 - JSONB querying via Supabase (`row_data->>'valor'`, filters, etc.)
 - Reasonable performance for tens of thousands of rows
 - No dynamic DDL
+- Survival across server restarts
 
 **Future upgrade path:** An optional operation that reads a dataset's schema, creates a real normalized Supabase table with proper columns/types, and migrates the JSONB rows into it. Triggered manually (not automatic).
 
@@ -255,21 +267,48 @@ Reuses the existing `configs/*.json` system. A sheet extraction config includes:
 
 ---
 
-## API Endpoint
+## API Endpoints
 
-```
-POST /extract-sheet
-```
+### `POST /extract-sheet`
 
 **Query params** (same pattern as `/extract`):
-- `config` — config name (default TBD)
-- `upload` — persist to Supabase (default: true)
-- `ocr_provider` — only relevant for scanned PDFs (default: docling)
-- `callback_url` — POST result on completion
+- `config` — config name (default: `financial_br`)
+- `upload` — persist to Supabase (default: `true`)
+- `ocr_provider` — only relevant for scanned PDFs (default: `docling`)
 
-**Input:** Multipart file upload or `?file_url=`
+**Input:** Multipart file upload
 
 **Response:** Returns immediately with dataset ID + `"processing"` status (async, same pattern as `/extract`).
+
+### `GET /datasets`
+
+List all datasets (merges in-memory + Supabase). Returns lightweight summaries: id, status, source_file, config_name, extracted_at, summary, schema_count, total_rows.
+
+### `GET /datasets/:id`
+
+Get full dataset by ID. Hydrates from Supabase on cache miss.
+
+### `GET /datasets/:id/rows`
+
+Paginated row query for a specific schema within a dataset.
+
+**Query params:**
+- `schema_name` — required, the schema to query (e.g. `card_transactions`)
+- `offset` — row offset (default: `0`)
+- `limit` — max rows to return (default: `100`)
+
+**Response:** `Vec<Value>` — just the row_data objects.
+
+### MCP Tools
+
+Four MCP tools expose the dataset pipeline to agents:
+
+| Tool | Description |
+|------|-------------|
+| `extract_sheet` | Upload CSV/Excel/PDF and extract tabular data |
+| `list_datasets` | List all datasets with summaries |
+| `get_dataset` | Get complete dataset with schemas and rows |
+| `query_dataset_rows` | Paginated row access for a specific schema |
 
 ---
 
@@ -278,12 +317,13 @@ POST /extract-sheet
 - **Same Rust server** (`src/main.rs`) — new route + handler
 - **Same config system** (`src/config.rs`, `configs/`) — extended for sheet configs
 - **Same OCR providers** (`src/ocr/`) — used only for scanned PDF inputs
-- **Same Supabase client** (`src/supabase.rs`) — extended for dataset tables
+- **Same Supabase client** (`src/supabase.rs`) — extended with `upload_dataset`, `list_datasets`, `fetch_dataset`, `query_dataset_rows`
 - **Same OpenRouter client** (`src/openrouter.rs`) — used for multi-turn agent
+- **MCP server** (`mcp-server/src/index.ts`) — 4 new tools: `extract_sheet`, `list_datasets`, `get_dataset`, `query_dataset_rows`
 - **New modules:**
   - `src/sheet_extractor.rs` — multi-turn agent loop, schema discovery, transform application
   - `src/sheet_parser.rs` — CSV/Excel direct parsing, table extraction from markdown
-  - `src/transforms.rs` — declarative transform functions
+  - `src/sheet_schema.rs` — `SheetExtraction`, `DataSchema`, `ColumnDef`, `SchemaRelationship` types
 
 ---
 
