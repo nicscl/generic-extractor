@@ -7,6 +7,7 @@ async function api(path: string, init?: RequestInit): Promise<unknown> {
     const body = await res.text().catch(() => "");
     throw new Error(`Extractor API ${res.status}: ${body}`);
   }
+  if (res.status === 204) return null;
   return res.json();
 }
 
@@ -144,6 +145,31 @@ export async function executeTool(
         if (args.limit !== undefined) params.set("limit", String(args.limit));
         const result = await api(`/datasets/${args.dataset_id}/rows?${params.toString()}`);
         return truncate(result);
+      }
+
+      case "create_config": {
+        const result = await api("/configs", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(args.config),
+        });
+        return truncate(result);
+      }
+
+      case "update_config": {
+        const result = await api(`/configs/${encodeURIComponent(String(args.name))}`, {
+          method: "PUT",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(args.config),
+        });
+        return truncate(result);
+      }
+
+      case "delete_config": {
+        await api(`/configs/${encodeURIComponent(String(args.name))}`, {
+          method: "DELETE",
+        });
+        return JSON.stringify({ success: true, message: `Config '${args.name}' deleted` });
       }
 
       default:

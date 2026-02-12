@@ -4,6 +4,7 @@ mod config;
 mod content_store;
 mod entities;
 mod extractor;
+mod gce;
 mod ocr;
 mod openrouter;
 mod schema;
@@ -60,15 +61,6 @@ async fn main() -> anyhow::Result<()> {
         .with(tracing_subscriber::fmt::layer())
         .init();
 
-    // Load configs from filesystem
-    let config_dir = std::path::Path::new("configs");
-    let configs = ConfigStore::load_from_dir(config_dir)?;
-    info!(
-        "Loaded {} configs: {:?}",
-        configs.list().len(),
-        configs.list()
-    );
-
     // Initialize OpenRouter client
     let openrouter = OpenRouterClient::from_env()?;
     info!("OpenRouter client initialized");
@@ -85,14 +77,60 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
+    // Load configs: Supabase-first with filesystem fallback + auto-seed
+    let config_dir = std::path::Path::new("configs");
+    let configs = if let Some(ref sb) = supabase {
+        match sb.list_configs().await {
+            Ok(sb_configs) if !sb_configs.is_empty() => {
+                info!("Loaded {} configs from Supabase", sb_configs.len());
+                ConfigStore::from_configs(sb_configs)?
+            }
+            Ok(_) => {
+                // Supabase table is empty — seed from disk if available
+                info!("Supabase configs table is empty, seeding from disk");
+                let store = ConfigStore::load_from_dir(config_dir)?;
+                let all = store.all();
+                for cfg in &all {
+                    if let Err(e) = sb.upsert_config(cfg).await {
+                        error!("Failed to seed config '{}' to Supabase: {}", cfg.name, e);
+                    }
+                }
+                info!("Seeded {} configs from disk to Supabase", all.len());
+                store
+            }
+            Err(e) => {
+                info!("Failed to load configs from Supabase ({}), falling back to disk", e);
+                ConfigStore::load_from_dir(config_dir)?
+            }
+        }
+    } else {
+        ConfigStore::load_from_dir(config_dir)?
+    };
+    info!(
+        "Loaded {} configs: {:?}",
+        configs.list().len(),
+        configs.list()
+    );
+
     // Initialize OCR providers
     let http_client = reqwest::Client::new();
     let mut ocr_providers: HashMap<OcrProviderKind, Arc<dyn OcrProvider>> = HashMap::new();
 
+    // GCE on-demand config (optional — all 4 env vars must be set)
+    let gce_config = gce::GceConfig::from_env();
+    if gce_config.is_some() {
+        info!("GCE on-demand enabled for Docling (will auto-start instance on connection failure)");
+    } else {
+        info!("GCE on-demand disabled (set GCE_PROJECT_ID, GCE_ZONE, GCE_INSTANCE_NAME, GCE_SA_KEY_PATH to enable)");
+    }
+
     // Docling is always available
     ocr_providers.insert(
         OcrProviderKind::Docling,
-        Arc::new(ocr::docling::DoclingProvider::new(http_client.clone())),
+        Arc::new(ocr::docling::DoclingProvider::new(
+            http_client.clone(),
+            gce_config,
+        )),
     );
     info!("OCR provider registered: docling");
 
@@ -134,8 +172,8 @@ async fn main() -> anyhow::Result<()> {
     // Build router
     let app = Router::new()
         .route("/health", get(health))
-        .route("/configs", get(list_configs))
-        .route("/configs/:name", get(get_config))
+        .route("/configs", get(list_configs).post(create_config))
+        .route("/configs/:name", get(get_config).put(update_config).delete(delete_config))
         .route("/extract", post(extract_document))
         .route("/extractions", get(list_extractions))
         .route("/extractions/:id/snapshot", get(get_extraction_snapshot))
@@ -172,7 +210,7 @@ async fn health() -> &'static str {
 
 /// List available configs.
 async fn list_configs(State(state): State<AppState>) -> Json<Vec<String>> {
-    Json(state.configs.list().iter().map(|s| s.to_string()).collect())
+    Json(state.configs.list())
 }
 
 /// Get a specific config.
@@ -183,9 +221,80 @@ async fn get_config(
     state
         .configs
         .get(&name)
-        .cloned()
         .map(Json)
         .ok_or(StatusCode::NOT_FOUND)
+}
+
+/// Create a new config.
+async fn create_config(
+    State(state): State<AppState>,
+    Json(config): Json<config::ExtractionConfig>,
+) -> Result<(StatusCode, Json<config::ExtractionConfig>), (StatusCode, String)> {
+    if config.name.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "Config name cannot be empty".to_string()));
+    }
+    if config.prompts.structure.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "prompts.structure cannot be empty".to_string()));
+    }
+
+    let supabase = state.supabase.as_ref().ok_or_else(|| {
+        (StatusCode::SERVICE_UNAVAILABLE, "Supabase not configured".to_string())
+    })?;
+
+    supabase.upsert_config(&config).await.map_err(|e| {
+        (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to save config: {}", e))
+    })?;
+
+    state.configs.insert(config.clone());
+    info!("Created config: {}", config.name);
+
+    Ok((StatusCode::CREATED, Json(config)))
+}
+
+/// Update an existing config.
+async fn update_config(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    Json(config): Json<config::ExtractionConfig>,
+) -> Result<Json<config::ExtractionConfig>, (StatusCode, String)> {
+    if config.name != name {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("URL name '{}' does not match config name '{}'", name, config.name),
+        ));
+    }
+
+    let supabase = state.supabase.as_ref().ok_or_else(|| {
+        (StatusCode::SERVICE_UNAVAILABLE, "Supabase not configured".to_string())
+    })?;
+
+    supabase.upsert_config(&config).await.map_err(|e| {
+        (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to update config: {}", e))
+    })?;
+
+    state.configs.insert(config.clone());
+    info!("Updated config: {}", config.name);
+
+    Ok(Json(config))
+}
+
+/// Delete a config.
+async fn delete_config(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let supabase = state.supabase.as_ref().ok_or_else(|| {
+        (StatusCode::SERVICE_UNAVAILABLE, "Supabase not configured".to_string())
+    })?;
+
+    supabase.delete_config(&name).await.map_err(|e| {
+        (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to delete config: {}", e))
+    })?;
+
+    state.configs.remove(&name);
+    info!("Deleted config: {}", name);
+
+    Ok(StatusCode::NO_CONTENT)
 }
 
 #[derive(serde::Deserialize)]
@@ -224,6 +333,7 @@ async fn extract_document(
             ),
         )
     })?;
+    let config = Arc::new(config);
 
     // Resolve OCR provider
     let provider_name = query.ocr_provider.as_deref().unwrap_or("docling");
@@ -288,7 +398,7 @@ async fn extract_document(
 
     // Spawn background task to run the pipeline
     let bg_state = state.clone();
-    let bg_config = config.clone();
+    let bg_config = config;
     let bg_upload = query.upload.unwrap_or(true);
     let bg_callback_url = query.callback_url.clone();
     let bg_id = extraction_id.clone();
@@ -668,6 +778,7 @@ async fn extract_sheet(
             ),
         )
     })?;
+    let config = Arc::new(config);
 
     let (filename, file_data) = read_file_input(multipart, None).await?;
 
@@ -725,7 +836,7 @@ async fn extract_sheet(
 
     // Spawn background task
     let bg_state = state.clone();
-    let bg_config = config.clone();
+    let bg_config = config;
     let bg_upload = query.upload.unwrap_or(true);
     let bg_id = dataset_id.clone();
 

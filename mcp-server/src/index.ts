@@ -23,6 +23,7 @@ async function api(path: string, init?: RequestInit): Promise<unknown> {
     const body = await res.text().catch(() => "");
     throw new Error(`API ${res.status}: ${body}`);
   }
+  if (res.status === 204) return null;
   return res.json();
 }
 
@@ -420,6 +421,97 @@ Returns the dataset placeholder JSON (id + processing status). Poll list_dataset
 
       return {
         content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+      };
+    },
+  );
+
+  // -------------------------------------------------------------------------
+  // Config management tools
+  // -------------------------------------------------------------------------
+
+  server.tool(
+    "create_config",
+    "Create a new extraction config. Provide the full ExtractionConfig JSON object.",
+    {
+      config: z
+        .object({
+          name: z.string().describe("Unique config name (e.g. 'legal_br')"),
+          description: z.string().describe("Human-readable description"),
+          prompts: z
+            .object({
+              structure: z.string().describe("System prompt for document structure extraction"),
+              metadata: z.string().optional().describe("Optional metadata extraction prompt"),
+              summary: z.string().optional().describe("Optional summary generation prompt"),
+            })
+            .describe("LLM prompts"),
+          node_types: z.array(z.any()).optional().describe("Node type definitions"),
+          relationship_types: z.array(z.string()).optional().describe("Relationship type names"),
+          metadata_schema: z.any().optional().describe("JSON schema for metadata"),
+          entity_patterns: z.array(z.any()).optional().describe("Regex-based entity patterns"),
+          readable_id_hint: z.string().optional().describe("Hint for extracting readable document ID"),
+          sheet_config: z.any().optional().describe("Sheet extraction config"),
+        })
+        .describe("Full ExtractionConfig JSON object"),
+    },
+    async ({ config }) => {
+      const result = await api("/configs", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(config),
+      });
+      return {
+        content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+      };
+    },
+  );
+
+  server.tool(
+    "update_config",
+    "Update an existing extraction config. Provide the config name and full ExtractionConfig JSON object.",
+    {
+      name: z.string().describe("Config name to update"),
+      config: z
+        .object({
+          name: z.string().describe("Config name (must match the name parameter)"),
+          description: z.string().describe("Human-readable description"),
+          prompts: z
+            .object({
+              structure: z.string().describe("System prompt for document structure extraction"),
+              metadata: z.string().optional().describe("Optional metadata extraction prompt"),
+              summary: z.string().optional().describe("Optional summary generation prompt"),
+            })
+            .describe("LLM prompts"),
+          node_types: z.array(z.any()).optional().describe("Node type definitions"),
+          relationship_types: z.array(z.string()).optional().describe("Relationship type names"),
+          metadata_schema: z.any().optional().describe("JSON schema for metadata"),
+          entity_patterns: z.array(z.any()).optional().describe("Regex-based entity patterns"),
+          readable_id_hint: z.string().optional().describe("Hint for extracting readable document ID"),
+          sheet_config: z.any().optional().describe("Sheet extraction config"),
+        })
+        .describe("Full ExtractionConfig JSON object"),
+    },
+    async ({ name, config }) => {
+      const result = await api(`/configs/${encodeURIComponent(name)}`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(config),
+      });
+      return {
+        content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+      };
+    },
+  );
+
+  server.tool(
+    "delete_config",
+    "Delete an extraction config by name.",
+    {
+      name: z.string().describe("Config name to delete"),
+    },
+    async ({ name }) => {
+      await api(`/configs/${encodeURIComponent(name)}`, { method: "DELETE" });
+      return {
+        content: [{ type: "text", text: `Config '${name}' deleted successfully.` }],
       };
     },
   );

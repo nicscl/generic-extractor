@@ -6,6 +6,7 @@ use serde::Deserialize;
 use serde_json::json;
 use tracing::{debug, info};
 
+use crate::config::ExtractionConfig;
 use crate::schema::{
     ConfidenceScores, DocumentNode, Extraction, ExtractionStatus, Relationship, StructureMapEntry,
 };
@@ -679,6 +680,93 @@ impl SupabaseClient {
 
         Ok(rows.into_iter().map(|r| r.row_data).collect())
     }
+
+    // ========================================================================
+    // Config methods
+    // ========================================================================
+
+    /// List all configs from Supabase.
+    pub async fn list_configs(&self) -> Result<Vec<ExtractionConfig>> {
+        let rows: Vec<ConfigRow> = self
+            .get_json("configs?select=config&order=name")
+            .await?;
+        Ok(rows.into_iter().map(|r| r.config).collect())
+    }
+
+    /// Get a single config by name.
+    pub async fn get_config(&self, name: &str) -> Result<Option<ExtractionConfig>> {
+        let rows: Vec<ConfigRow> = self
+            .get_json(&format!("configs?name=eq.{}&select=config", name))
+            .await?;
+        Ok(rows.into_iter().next().map(|r| r.config))
+    }
+
+    /// Upsert a config (insert or update).
+    pub async fn upsert_config(&self, config: &ExtractionConfig) -> Result<()> {
+        let url = format!("{}/rest/v1/configs", self.base_url);
+
+        let body = json!({
+            "name": config.name,
+            "config": config,
+        });
+
+        let resp = self
+            .client
+            .post(&url)
+            .header("apikey", &self.service_role_key)
+            .header("Authorization", format!("Bearer {}", self.service_role_key))
+            .header("Content-Type", "application/json")
+            .header("Content-Profile", "extraction")
+            .header("Prefer", "resolution=merge-duplicates,return=minimal")
+            .json(&body)
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            return Err(anyhow!(
+                "Failed to upsert config '{}': {} - {}",
+                config.name,
+                status,
+                text
+            ));
+        }
+
+        debug!("Upserted config: {}", config.name);
+        Ok(())
+    }
+
+    /// Delete a config by name.
+    pub async fn delete_config(&self, name: &str) -> Result<()> {
+        let url = format!(
+            "{}/rest/v1/configs?name=eq.{}",
+            self.base_url, name
+        );
+
+        let resp = self
+            .client
+            .delete(&url)
+            .header("apikey", &self.service_role_key)
+            .header("Authorization", format!("Bearer {}", self.service_role_key))
+            .header("Content-Profile", "extraction")
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            return Err(anyhow!(
+                "Failed to delete config '{}': {} - {}",
+                name,
+                status,
+                text
+            ));
+        }
+
+        debug!("Deleted config: {}", name);
+        Ok(())
+    }
 }
 
 // ============================================================================
@@ -730,6 +818,15 @@ struct RelationshipRow {
     from_node: String,
     to_node: String,
     relationship_type: String,
+}
+
+// ============================================================================
+// Config row types
+// ============================================================================
+
+#[derive(Debug, Deserialize)]
+struct ConfigRow {
+    config: ExtractionConfig,
 }
 
 // ============================================================================

@@ -1,0 +1,19 @@
+[project]
+name = "docling-sidecar"
+version = "0.1.0"
+description = "Docling PDF processing sidecar for generic-extractor (GPU variant)"
+requires-python = ">=3.10"
+dependencies = [
+    "docling>=2.70.0",
+    "fastapi>=0.115.0",
+    "uvicorn>=0.30.0",
+    "python-multipart>=0.0.9",
+    "torch>=2.0.0",
+    "torchvision>=0.15.0",
+]
+
+# No CPU-only overrides — uses default CUDA-enabled PyTorch from PyPI.
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"

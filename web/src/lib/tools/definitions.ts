@@ -1,4 +1,4 @@
-// 10 tools in OpenAI function-calling format, derived from MCP tool definitions
+// 13 tools in OpenAI function-calling format, derived from MCP tool definitions
 
 export interface ToolDefinition {
   type: "function";
@@ -209,6 +209,57 @@ export const toolDefinitions: ToolDefinition[] = [
           limit: { type: "number", description: "Max rows. Default: 100" },
         },
         required: ["dataset_id", "schema_name"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "create_config",
+      description:
+        "Create a new extraction config. Provide the full ExtractionConfig JSON object.",
+      parameters: {
+        type: "object",
+        properties: {
+          config: {
+            type: "object",
+            description: "Full ExtractionConfig JSON object with name, description, prompts, etc.",
+          },
+        },
+        required: ["config"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "update_config",
+      description:
+        "Update an existing extraction config. Provide the config name and full ExtractionConfig JSON object.",
+      parameters: {
+        type: "object",
+        properties: {
+          name: { type: "string", description: "Config name to update" },
+          config: {
+            type: "object",
+            description: "Full ExtractionConfig JSON object (name must match)",
+          },
+        },
+        required: ["name", "config"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "delete_config",
+      description: "Delete an extraction config by name.",
+      parameters: {
+        type: "object",
+        properties: {
+          name: { type: "string", description: "Config name to delete" },
+        },
+        required: ["name"],
       },
     },
   },

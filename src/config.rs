@@ -1,13 +1,14 @@
 #![allow(dead_code)]
 //! Extraction configuration system.
 //!
-//! Configs are loaded from `configs/` directory at startup and kept in memory.
+//! Configs are loaded from Supabase (primary) or `configs/` directory (fallback).
+//! In-memory cache is backed by `RwLock` for runtime CRUD.
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use tracing::info;
 
 /// Configuration for a specific extraction domain.
@@ -97,11 +98,11 @@ fn default_true() -> bool {
     true
 }
 
-/// In-memory store for all loaded configs.
-#[derive(Debug, Clone)]
+/// In-memory store for all loaded configs, backed by `RwLock` for runtime mutations.
+#[derive(Debug)]
 pub struct ConfigStore {
-    configs: Arc<HashMap<String, ExtractionConfig>>,
-    default_config: String,
+    configs: Arc<RwLock<HashMap<String, ExtractionConfig>>>,
+    default_config: RwLock<String>,
 }
 
 impl ConfigStore {
@@ -133,31 +134,77 @@ impl ConfigStore {
             anyhow::bail!("No configs found in {:?}", dir);
         }
 
-        // Use first config as default, or "default" if exists
-        let default_config = configs
-            .get("default")
-            .map(|c| c.name.clone())
-            .unwrap_or_else(|| configs.keys().next().unwrap().clone());
+        let default_config = Self::pick_default(&configs);
 
         Ok(Self {
-            configs: Arc::new(configs),
-            default_config,
+            configs: Arc::new(RwLock::new(configs)),
+            default_config: RwLock::new(default_config),
         })
     }
 
-    /// Get a config by name.
-    pub fn get(&self, name: &str) -> Option<&ExtractionConfig> {
-        self.configs.get(name)
+    /// Create a ConfigStore from a list of configs (e.g. loaded from Supabase).
+    pub fn from_configs(configs: Vec<ExtractionConfig>) -> Result<Self> {
+        if configs.is_empty() {
+            anyhow::bail!("No configs provided");
+        }
+
+        let map: HashMap<String, ExtractionConfig> = configs
+            .into_iter()
+            .map(|c| (c.name.clone(), c))
+            .collect();
+
+        let default_config = Self::pick_default(&map);
+
+        Ok(Self {
+            configs: Arc::new(RwLock::new(map)),
+            default_config: RwLock::new(default_config),
+        })
     }
 
-    /// Get the default config.
-    pub fn default(&self) -> &ExtractionConfig {
-        self.configs.get(&self.default_config).unwrap()
+    /// Get a config by name (returns clone).
+    pub fn get(&self, name: &str) -> Option<ExtractionConfig> {
+        self.configs.read().unwrap().get(name).cloned()
+    }
+
+    /// Get the default config (returns clone).
+    pub fn default_config(&self) -> ExtractionConfig {
+        let default_name = self.default_config.read().unwrap().clone();
+        self.configs
+            .read()
+            .unwrap()
+            .get(&default_name)
+            .cloned()
+            .expect("default config must exist")
     }
 
     /// List all available config names.
-    pub fn list(&self) -> Vec<&str> {
-        self.configs.keys().map(|s| s.as_str()).collect()
+    pub fn list(&self) -> Vec<String> {
+        self.configs.read().unwrap().keys().cloned().collect()
+    }
+
+    /// Insert or update a config in the in-memory cache.
+    pub fn insert(&self, config: ExtractionConfig) {
+        self.configs
+            .write()
+            .unwrap()
+            .insert(config.name.clone(), config);
+    }
+
+    /// Remove a config from the in-memory cache. Returns true if it existed.
+    pub fn remove(&self, name: &str) -> bool {
+        self.configs.write().unwrap().remove(name).is_some()
+    }
+
+    /// Get all configs as a Vec (for seeding).
+    pub fn all(&self) -> Vec<ExtractionConfig> {
+        self.configs.read().unwrap().values().cloned().collect()
+    }
+
+    fn pick_default(configs: &HashMap<String, ExtractionConfig>) -> String {
+        configs
+            .get("default")
+            .map(|c| c.name.clone())
+            .unwrap_or_else(|| configs.keys().next().unwrap().clone())
     }
 }
 

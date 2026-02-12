@@ -11,7 +11,10 @@ You have access to the **Generic Extractor** MCP server, which provides two extr
 
 | Tool | Purpose |
 |------|---------|
-| `list_configs` | List available extraction configs (e.g. `legal_br`) |
+| `list_configs` | List available extraction config names |
+| `create_config` | Create a new extraction config |
+| `update_config` | Update an existing extraction config |
+| `delete_config` | Delete an extraction config |
 | `list_extractions` | List/search extractions by `readable_id` (case number, invoice ID, etc.) |
 | `extract_document` | Upload a PDF and run the full extraction pipeline |
 | `get_extraction_snapshot` | Get the complete document tree (summaries only, no raw text) |
@@ -171,6 +174,54 @@ User uploads a file via your UI → your app base64-encodes it
 - **Columns** — Typed column definitions with `name`, `data_type` (string, number, date, currency, etc.), optional `format` (e.g. "DD/MM/YYYY"), optional `transform` (e.g. "parse_brl_currency"), and `required` flag.
 - **Relationships** — Cross-schema relationships (e.g. foreign keys between a transactions table and a categories table).
 - **Dataset vs Extraction** — Extractions produce hierarchical document trees; datasets produce flat typed tables. Use `extract_document` for documents, `extract_sheet` for tabular data.
+
+## Managing Configs
+
+Configs define how documents are extracted (prompts, node types, entity patterns, etc.). They are stored in Supabase and can be managed at runtime.
+
+### Creating a config
+
+```json
+// create_config
+{
+  "config": {
+    "name": "my_domain",
+    "description": "Extraction config for my domain",
+    "prompts": {
+      "structure": "You are a document analyzer. Extract the hierarchical structure..."
+    },
+    "node_types": [
+      { "id": "DOCUMENT", "label": "Document", "subtypes": [] },
+      { "id": "SECTION", "label": "Section", "subtypes": [] }
+    ],
+    "relationship_types": ["references", "contains"],
+    "entity_patterns": []
+  }
+}
+```
+
+### Updating a config
+
+```json
+// update_config
+{
+  "name": "my_domain",
+  "config": {
+    "name": "my_domain",
+    "description": "Updated description",
+    "prompts": { "structure": "Updated prompt..." },
+    "node_types": [],
+    "relationship_types": []
+  }
+}
+```
+
+### Deleting a config
+
+```json
+// delete_config
+{ "name": "my_domain" }
+```
 
 ## Guidelines
 

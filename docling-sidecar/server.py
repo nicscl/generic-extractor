@@ -7,6 +7,7 @@ Keeps models loaded in memory for fast per-request processing.
 
 import io
 import logging
+import pathlib
 from typing import Any
 
 from fastapi import FastAPI, File, UploadFile, HTTPException
@@ -22,6 +23,15 @@ app = FastAPI(
     description="PDF processing service using Docling",
     version="0.1.0",
 )
+
+# Activity tracking for idle-shutdown (GCE auto-stop)
+ACTIVITY_FILE = pathlib.Path("/tmp/docling_last_activity")
+
+def touch_activity():
+    try:
+        ACTIVITY_FILE.touch()
+    except OSError:
+        pass
 
 # Lazy-load docling to avoid import time at startup
 _converter = None
@@ -67,9 +77,11 @@ async def convert_document(file: UploadFile = File(...)):
     - Page-by-page OCR text
     - Document metadata
     """
+    touch_activity()
+
     if not file.filename:
         raise HTTPException(status_code=400, detail="No filename provided")
-    
+
     # Read file content
     content = await file.read()
     logger.info(f"Received file: {file.filename} ({len(content)} bytes)")
@@ -161,9 +173,11 @@ async def convert_document_json(file: UploadFile = File(...)):
     
     Returns the full DoclingDocument as JSON for maximum detail.
     """
+    touch_activity()
+
     if not file.filename:
         raise HTTPException(status_code=400, detail="No filename provided")
-    
+
     content = await file.read()
     logger.info(f"Received file for JSON export: {file.filename} ({len(content)} bytes)")
     
