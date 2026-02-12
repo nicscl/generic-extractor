@@ -275,6 +275,216 @@ Returns the full extraction result with ID, summary, structure map, and document
       };
     },
   );
+
+  // -------------------------------------------------------------------------
+  // Sheet / Dataset tools
+  // -------------------------------------------------------------------------
+
+  server.tool(
+    "extract_sheet",
+    `Upload a file (CSV, Excel, or PDF) and extract structured tabular data with LLM-discovered schemas. Provide the file via exactly ONE of:
+- file_path: local filesystem path (for STDIO/local usage)
+- file_base64: base64-encoded file content (for remote HTTP usage)
+- file_url: URL to download the file from (for remote HTTP usage)
+Returns the dataset placeholder JSON (id + processing status). Poll list_datasets or get_dataset to check completion.`,
+    {
+      file_path: z
+        .string()
+        .optional()
+        .describe("Absolute path to the file on disk (CSV, Excel, or PDF)"),
+      file_base64: z
+        .string()
+        .optional()
+        .describe(
+          "Base64-encoded file content. Must also provide file_name.",
+        ),
+      file_url: z
+        .string()
+        .url()
+        .optional()
+        .describe("URL to download the file from."),
+      file_name: z
+        .string()
+        .optional()
+        .describe(
+          "Filename (required with file_base64, optional otherwise). Example: 'data.csv', 'report.xlsx'",
+        ),
+      config: z
+        .string()
+        .optional()
+        .default("financial_br")
+        .describe("Extraction config name"),
+      upload: z
+        .boolean()
+        .optional()
+        .default(true)
+        .describe("Whether to persist the dataset to Supabase"),
+    },
+    async ({ file_path, file_base64, file_url, file_name, config, upload }) => {
+      let fileBuffer: Uint8Array;
+      let fileName: string;
+
+      const sourceCount = [file_path, file_base64, file_url].filter(Boolean).length;
+      if (sourceCount === 0) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: "Error: Provide exactly one of file_path, file_base64, or file_url.",
+            },
+          ],
+          isError: true,
+        };
+      }
+      if (sourceCount > 1) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: "Error: Provide only ONE of file_path, file_base64, or file_url — not multiple.",
+            },
+          ],
+          isError: true,
+        };
+      }
+
+      if (file_path) {
+        fileBuffer = new Uint8Array(await readFile(file_path));
+        fileName = file_name ?? basename(file_path);
+      } else if (file_base64) {
+        if (!file_name) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: "Error: file_name is required when using file_base64.",
+              },
+            ],
+            isError: true,
+          };
+        }
+        fileBuffer = new Uint8Array(Buffer.from(file_base64, "base64"));
+        fileName = file_name;
+      } else if (file_url) {
+        const urlRes = await fetch(file_url);
+        if (!urlRes.ok) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: `Error: Failed to download file from URL (${urlRes.status}): ${await urlRes.text().catch(() => "")}`,
+              },
+            ],
+            isError: true,
+          };
+        }
+        fileBuffer = new Uint8Array(await urlRes.arrayBuffer());
+        fileName =
+          file_name ??
+          new URL(file_url).pathname.split("/").pop() ??
+          "data.csv";
+      } else {
+        return {
+          content: [{ type: "text", text: "Error: No file source provided." }],
+          isError: true,
+        };
+      }
+
+      // Detect MIME type from extension
+      const ext = fileName.split(".").pop()?.toLowerCase() ?? "";
+      const mimeMap: Record<string, string> = {
+        csv: "text/csv",
+        xlsx: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        xlsm: "application/vnd.ms-excel.sheet.macroEnabled.12",
+        xlsb: "application/vnd.ms-excel.sheet.binary.macroEnabled.12",
+        xls: "application/vnd.ms-excel",
+        pdf: "application/pdf",
+      };
+      const mimeType = mimeMap[ext] ?? "application/octet-stream";
+
+      const form = new FormData();
+      form.append(
+        "file",
+        new Blob([fileBuffer as BlobPart], { type: mimeType }),
+        fileName,
+      );
+
+      const params = new URLSearchParams();
+      if (config) params.set("config", config);
+      if (upload !== undefined) params.set("upload", String(upload));
+
+      const result = await api(`/extract-sheet?${params.toString()}`, {
+        method: "POST",
+        body: form,
+      });
+
+      return {
+        content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+      };
+    },
+  );
+
+  server.tool(
+    "list_datasets",
+    "List all datasets with their IDs, source files, summaries, schema counts, and row counts. Datasets are created by extract_sheet from CSV, Excel, or PDF files.",
+    {},
+    async () => {
+      const datasets = await api("/datasets");
+      return {
+        content: [{ type: "text", text: JSON.stringify(datasets, null, 2) }],
+      };
+    },
+  );
+
+  server.tool(
+    "get_dataset",
+    "Get a complete dataset by ID, including all discovered schemas, column definitions, and typed rows. Use this to inspect the full extraction result from extract_sheet.",
+    {
+      dataset_id: z.string().describe("The dataset ID (e.g. ds_abc123...)"),
+    },
+    async ({ dataset_id }) => {
+      const result = await api(`/datasets/${dataset_id}`);
+      return {
+        content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+      };
+    },
+  );
+
+  server.tool(
+    "query_dataset_rows",
+    "Query rows from a specific schema within a dataset. Use for paginated access to large datasets. Returns just the row data (no column definitions).",
+    {
+      dataset_id: z.string().describe("The dataset ID"),
+      schema_name: z
+        .string()
+        .describe("The schema name within the dataset (e.g. 'card_transactions')"),
+      offset: z
+        .number()
+        .int()
+        .min(0)
+        .optional()
+        .default(0)
+        .describe("Row offset to start from"),
+      limit: z
+        .number()
+        .int()
+        .min(1)
+        .optional()
+        .default(100)
+        .describe("Maximum rows to return"),
+    },
+    async ({ dataset_id, schema_name, offset, limit }) => {
+      const params = new URLSearchParams();
+      params.set("schema_name", schema_name);
+      if (offset !== undefined) params.set("offset", String(offset));
+      if (limit !== undefined) params.set("limit", String(limit));
+
+      const result = await api(`/datasets/${dataset_id}/rows?${params.toString()}`);
+      return {
+        content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+      };
+    },
+  );
 }
 
 // ---------------------------------------------------------------------------
