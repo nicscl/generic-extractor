@@ -38,6 +38,10 @@ anyhow = "1"
 # Config
 dotenvy = "0.15"
 
+# Tabular data parsing
+csv = "1"
+calamine = "0.25"
+
 # Logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

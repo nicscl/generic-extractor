@@ -1,0 +1,37 @@
+{
+    "name": "financial_br",
+    "description": "Brazilian financial spreadsheets and tabular data",
+    "prompts": {
+        "structure": "Analise dados tabulares financeiros brasileiros e extraia a estrutura hierárquica."
+    },
+    "node_types": [],
+    "relationship_types": [],
+    "metadata_schema": {},
+    "entity_patterns": [],
+    "sheet_config": {
+        "expected_columns": [
+            {
+                "name": "data",
+                "data_type": "date",
+                "format": "DD/MM/YYYY",
+                "required": true
+            },
+            {
+                "name": "valor",
+                "data_type": "currency_brl",
+                "required": true
+            },
+            {
+                "name": "descricao",
+                "data_type": "string",
+                "required": false
+            },
+            {
+                "name": "categoria",
+                "data_type": "string",
+                "required": false
+            }
+        ],
+        "classification_hints": "Valores monetários estão em BRL (formato: 1.234,56). Datas seguem o padrão DD/MM/YYYY. Categorias podem incluir: alimentação, transporte, moradia, saúde, lazer, educação, salário, investimento. Créditos e débitos podem estar em colunas separadas ou indicados por sinal (+/-)."
+    }
+}

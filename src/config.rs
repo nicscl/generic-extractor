@@ -28,6 +28,32 @@ pub struct ExtractionConfig {
     /// Hint for extracting a human-readable document identifier (e.g. case number, invoice ID).
     #[serde(default)]
     pub readable_id_hint: Option<String>,
+    /// Sheet extraction config (for tabular data pipelines).
+    #[serde(default)]
+    pub sheet_config: Option<SheetConfig>,
+}
+
+/// Configuration for sheet/tabular data extraction.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SheetConfig {
+    /// Expected columns the agent should look for.
+    #[serde(default)]
+    pub expected_columns: Vec<ExpectedColumn>,
+    /// Business-specific hints injected into the LLM prompt.
+    #[serde(default)]
+    pub classification_hints: Option<String>,
+}
+
+/// A column the agent should expect to find in the data.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExpectedColumn {
+    pub name: String,
+    #[serde(default)]
+    pub data_type: Option<String>,
+    #[serde(default)]
+    pub format: Option<String>,
+    #[serde(default)]
+    pub required: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -175,5 +201,6 @@ Return a JSON object with:
         metadata_schema: serde_json::json!({}),
         entity_patterns: Vec::new(),
         readable_id_hint: None,
+        sheet_config: None,
     }
 }

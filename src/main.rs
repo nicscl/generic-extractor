@@ -7,6 +7,9 @@ mod extractor;
 mod ocr;
 mod openrouter;
 mod schema;
+mod sheet_extractor;
+mod sheet_parser;
+mod sheet_schema;
 mod supabase;
 
 use axum::{
@@ -22,6 +25,7 @@ use extractor::Extractor;
 use ocr::{OcrInput, OcrProvider, OcrProviderKind};
 use openrouter::OpenRouterClient;
 use schema::{Extraction, ExtractionStatus};
+use sheet_schema::SheetExtraction;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 use tower_http::cors::CorsLayer;
@@ -33,6 +37,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 #[derive(Clone)]
 struct AppState {
     extractions: Arc<RwLock<HashMap<String, Extraction>>>,
+    datasets: Arc<RwLock<HashMap<String, SheetExtraction>>>,
     content_store: ContentStore,
     openrouter: Arc<OpenRouterClient>,
     configs: Arc<ConfigStore>,
@@ -110,9 +115,14 @@ async fn main() -> anyhow::Result<()> {
         info!("OCR provider skipped: smol_docling (SMOL_DOCLING_URL not set)");
     }
 
+    // Load persisted datasets from disk
+    let datasets = load_datasets_from_disk();
+    info!("Loaded {} dataset(s) from data/datasets/", datasets.len());
+
     // Build application state
     let state = AppState {
         extractions: Arc::new(RwLock::new(HashMap::new())),
+        datasets: Arc::new(RwLock::new(datasets)),
         content_store: ContentStore::new(),
         openrouter: Arc::new(openrouter),
         configs: Arc::new(configs),
@@ -132,6 +142,9 @@ async fn main() -> anyhow::Result<()> {
         .route("/extractions/:id", get(get_extraction))
         .route("/extractions/:id/node/:node_id", get(get_node))
         .route("/content/:ref_path", get(get_content))
+        .route("/extract-sheet", post(extract_sheet))
+        .route("/datasets", get(list_datasets))
+        .route("/datasets/:id", get(get_dataset))
         .layer(DefaultBodyLimit::max(100 * 1024 * 1024)) // 100MB
         .layer(TraceLayer::new_for_http())
         .layer(CorsLayer::permissive())
@@ -233,81 +246,31 @@ async fn extract_document(
     })?;
     let provider = Arc::clone(provider);
 
-    // Build OCR input from either multipart upload or URL
-    let ocr_input = if let Some(file_url) = &query.file_url {
-        // Derive filename from URL path
-        let url_filename = file_url
-            .rsplit('/')
-            .next()
-            .and_then(|s| s.split('?').next())
-            .filter(|s| !s.is_empty())
-            .unwrap_or("document.pdf")
-            .to_string();
+    // Read file input from multipart or URL
+    let (filename_for_log, file_data) =
+        read_file_input(multipart, query.file_url.as_deref()).await?;
 
+    // Build OCR input
+    let ocr_input = if let Some(file_url) = &query.file_url {
         info!(
             "Received file_url: {} (ocr_provider={})",
             file_url, provider_name
         );
-
         OcrInput::Url {
-            filename: url_filename,
+            filename: filename_for_log.clone(),
             url: file_url.clone(),
         }
-    } else if let Some(mut multipart) = multipart {
-        // Multipart file upload
-        let mut filename = String::new();
-        let mut file_data = Vec::new();
-
-        while let Some(field) = multipart
-            .next_field()
-            .await
-            .map_err(|e| (StatusCode::BAD_REQUEST, format!("Multipart error: {}", e)))?
-        {
-            if field.name() == Some("file") {
-                filename = field.file_name().unwrap_or("document").to_string();
-                file_data = field
-                    .bytes()
-                    .await
-                    .map_err(|e| {
-                        (
-                            StatusCode::BAD_REQUEST,
-                            format!("Failed to read file: {}", e),
-                        )
-                    })?
-                    .to_vec();
-                break;
-            }
-        }
-
-        if file_data.is_empty() {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                "No file uploaded. Send multipart 'file' field or use ?file_url= parameter."
-                    .to_string(),
-            ));
-        }
-
+    } else {
         info!(
             "Received file: {} ({} bytes, ocr_provider={})",
-            filename,
+            filename_for_log,
             file_data.len(),
             provider_name
         );
-
         OcrInput::Bytes {
-            filename,
+            filename: filename_for_log.clone(),
             data: file_data,
         }
-    } else {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            "No file provided. Send multipart 'file' field or use ?file_url= parameter."
-                .to_string(),
-        ));
-    };
-
-    let filename_for_log = match &ocr_input {
-        OcrInput::Bytes { filename, .. } | OcrInput::Url { filename, .. } => filename.clone(),
     };
 
     // Create a placeholder extraction with status "processing"
@@ -671,6 +634,372 @@ async fn get_content(
     }
 
     Err(StatusCode::NOT_FOUND)
+}
+
+// ============================================================================
+// Sheet extraction handlers
+// ============================================================================
+
+#[derive(serde::Deserialize)]
+struct SheetExtractQuery {
+    config: Option<String>,
+    ocr_provider: Option<String>,
+}
+
+/// Upload a file and start async sheet extraction.
+/// Supports CSV, Excel (.xlsx/.xlsm/.xlsb), and PDF (via OCR → table parsing).
+/// Returns immediately with dataset ID and status "processing".
+/// Poll GET /datasets/:id to check when status becomes "completed" or "failed".
+async fn extract_sheet(
+    State(state): State<AppState>,
+    Query(query): Query<SheetExtractQuery>,
+    multipart: Option<Multipart>,
+) -> Result<Json<SheetExtraction>, (StatusCode, String)> {
+    let config_name = query.config.as_deref().unwrap_or("financial_br");
+    let config = state.configs.get(config_name).ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!(
+                "Unknown config: {}. Available: {:?}",
+                config_name,
+                state.configs.list()
+            ),
+        )
+    })?;
+
+    let (filename, file_data) = read_file_input(multipart, None).await?;
+
+    let ext = filename
+        .rsplit('.')
+        .next()
+        .unwrap_or("")
+        .to_lowercase();
+    let is_pdf = ext == "pdf";
+
+    // For PDFs, resolve OCR provider
+    let ocr_provider = if is_pdf {
+        let provider_name = query.ocr_provider.as_deref().unwrap_or("docling");
+        let provider_kind = OcrProviderKind::from_str(provider_name).ok_or_else(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "Unknown ocr_provider: '{}'. Available: docling, mistral_ocr, smol_docling",
+                    provider_name
+                ),
+            )
+        })?;
+        let provider = state.ocr_providers.get(&provider_kind).ok_or_else(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "OCR provider '{}' is not configured. Check env vars.",
+                    provider_name
+                ),
+            )
+        })?;
+        Some(Arc::clone(provider))
+    } else {
+        None
+    };
+
+    info!(
+        "Received sheet file: {} ({} bytes, config={}, pdf={})",
+        filename,
+        file_data.len(),
+        config_name,
+        is_pdf
+    );
+
+    // Create placeholder
+    let dataset = SheetExtraction::new(filename.clone(), Some(config_name.to_string()));
+    let dataset_id = dataset.id.clone();
+
+    {
+        let mut datasets = state.datasets.write().unwrap();
+        datasets.insert(dataset.id.clone(), dataset.clone());
+    }
+
+    info!("Queued sheet extraction {} for async processing", dataset_id);
+
+    // Spawn background task
+    let bg_state = state.clone();
+    let bg_config = config.clone();
+    let bg_id = dataset_id.clone();
+
+    tokio::spawn(async move {
+        // Step 1: Get raw sheets — either direct parse or OCR → table extraction
+        let sheets = if let Some(provider) = ocr_provider {
+            // PDF path: OCR → markdown → extract tables
+            let ocr_input = OcrInput::Bytes {
+                filename: filename.clone(),
+                data: file_data,
+            };
+
+            let ocr_result = match provider.process(&ocr_input).await {
+                Ok(r) => r,
+                Err(e) => {
+                    error!("OCR failed for sheet extraction {}: {}", bg_id, e);
+                    let mut datasets = bg_state.datasets.write().unwrap();
+                    if let Some(ds) = datasets.get_mut(&bg_id) {
+                        ds.status = ExtractionStatus::Failed;
+                        ds.error = Some(format!("OCR failed: {}", e));
+                    }
+                    return;
+                }
+            };
+
+            info!(
+                "OCR complete for {}: {} pages, {} chars",
+                bg_id, ocr_result.total_pages, ocr_result.markdown.len()
+            );
+
+            // Debug: dump OCR markdown to disk for inspection
+            let dump_dir = std::path::Path::new("data/debug");
+            let _ = std::fs::create_dir_all(dump_dir);
+            let dump_path = dump_dir.join(format!("{}_ocr.md", bg_id));
+            if let Err(e) = std::fs::write(&dump_path, &ocr_result.markdown) {
+                error!("Failed to dump OCR markdown: {}", e);
+            } else {
+                info!("Dumped OCR markdown to {:?}", dump_path);
+            }
+
+            match sheet_parser::parse_ocr_markdown(&ocr_result) {
+                Ok(s) => s,
+                Err(e) => {
+                    error!("No tables found in OCR output for {}: {}", bg_id, e);
+                    let mut datasets = bg_state.datasets.write().unwrap();
+                    if let Some(ds) = datasets.get_mut(&bg_id) {
+                        ds.status = ExtractionStatus::Failed;
+                        ds.error = Some(format!("No tables found in PDF: {}", e));
+                    }
+                    return;
+                }
+            }
+        } else {
+            // Direct parse: CSV / Excel
+            match sheet_parser::parse_file(&filename, &file_data) {
+                Ok(s) => s,
+                Err(e) => {
+                    error!("Sheet parsing failed for {}: {}", bg_id, e);
+                    let mut datasets = bg_state.datasets.write().unwrap();
+                    if let Some(ds) = datasets.get_mut(&bg_id) {
+                        ds.status = ExtractionStatus::Failed;
+                        ds.error = Some(format!("Parsing failed: {}", e));
+                    }
+                    return;
+                }
+            }
+        };
+
+        info!(
+            "Parsed {} sheet(s) for {}: {}",
+            sheets.len(),
+            bg_id,
+            sheets
+                .iter()
+                .map(|s| format!("\"{}\" ({} rows)", s.name, s.rows.len()))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+
+        // Step 2: LLM schema discovery
+        let extractor = sheet_extractor::SheetExtractor::new((*bg_state.openrouter).clone());
+        let mut completed = match extractor.extract(&filename, &sheets, &bg_config).await {
+            Ok(ext) => ext,
+            Err(e) => {
+                error!("Sheet extraction failed for {}: {}", bg_id, e);
+                let mut datasets = bg_state.datasets.write().unwrap();
+                if let Some(ds) = datasets.get_mut(&bg_id) {
+                    ds.status = ExtractionStatus::Failed;
+                    ds.error = Some(format!("Extraction failed: {}", e));
+                }
+                return;
+            }
+        };
+
+        // Preserve original ID and mark completed
+        completed.id = bg_id.clone();
+        completed.status = ExtractionStatus::Completed;
+
+        // Persist to disk
+        if let Err(e) = save_dataset_to_disk(&completed) {
+            error!("Failed to persist dataset {} to disk: {}", bg_id, e);
+        }
+
+        {
+            let mut datasets = bg_state.datasets.write().unwrap();
+            datasets.insert(bg_id.clone(), completed);
+        }
+
+        info!("Sheet extraction complete: {}", bg_id);
+    });
+
+    Ok(Json(dataset))
+}
+
+#[derive(serde::Serialize)]
+struct DatasetSummary {
+    id: String,
+    status: ExtractionStatus,
+    source_file: String,
+    config_name: Option<String>,
+    extracted_at: String,
+    summary: String,
+    schema_count: usize,
+    total_rows: usize,
+}
+
+/// List all datasets (lightweight summaries).
+async fn list_datasets(State(state): State<AppState>) -> Json<Vec<DatasetSummary>> {
+    let datasets = state.datasets.read().unwrap();
+    let mut list: Vec<DatasetSummary> = datasets
+        .values()
+        .map(|d| DatasetSummary {
+            id: d.id.clone(),
+            status: d.status.clone(),
+            source_file: d.source_file.clone(),
+            config_name: d.config_name.clone(),
+            extracted_at: d.extracted_at.clone(),
+            summary: d.summary.clone(),
+            schema_count: d.schemas.len(),
+            total_rows: d.schemas.iter().map(|s| s.row_count).sum(),
+        })
+        .collect();
+    list.sort_by(|a, b| b.extracted_at.cmp(&a.extracted_at));
+    Json(list)
+}
+
+/// Get a dataset by ID.
+async fn get_dataset(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<SheetExtraction>, StatusCode> {
+    let datasets = state.datasets.read().unwrap();
+    datasets
+        .get(&id)
+        .cloned()
+        .map(Json)
+        .ok_or(StatusCode::NOT_FOUND)
+}
+
+// ============================================================================
+// Shared helpers
+// ============================================================================
+
+/// Read file data from either a multipart upload or a URL parameter.
+/// Returns (filename, file_bytes).
+async fn read_file_input(
+    multipart: Option<Multipart>,
+    file_url: Option<&str>,
+) -> Result<(String, Vec<u8>), (StatusCode, String)> {
+    if let Some(file_url) = file_url {
+        let filename = file_url
+            .rsplit('/')
+            .next()
+            .and_then(|s| s.split('?').next())
+            .filter(|s| !s.is_empty())
+            .unwrap_or("document")
+            .to_string();
+
+        // For URL-based input, we don't download here (OCR providers handle URLs directly)
+        // Return empty bytes — the caller will use OcrInput::Url
+        Ok((filename, Vec::new()))
+    } else if let Some(mut multipart) = multipart {
+        let mut filename = String::new();
+        let mut file_data = Vec::new();
+
+        while let Some(field) = multipart
+            .next_field()
+            .await
+            .map_err(|e| (StatusCode::BAD_REQUEST, format!("Multipart error: {}", e)))?
+        {
+            if field.name() == Some("file") {
+                filename = field.file_name().unwrap_or("document").to_string();
+                file_data = field
+                    .bytes()
+                    .await
+                    .map_err(|e| {
+                        (
+                            StatusCode::BAD_REQUEST,
+                            format!("Failed to read file: {}", e),
+                        )
+                    })?
+                    .to_vec();
+                break;
+            }
+        }
+
+        if file_data.is_empty() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "No file uploaded. Send multipart 'file' field or use ?file_url= parameter."
+                    .to_string(),
+            ));
+        }
+
+        Ok((filename, file_data))
+    } else {
+        Err((
+            StatusCode::BAD_REQUEST,
+            "No file provided. Send multipart 'file' field or use ?file_url= parameter."
+                .to_string(),
+        ))
+    }
+}
+
+// ============================================================================
+// Dataset persistence (file-backed)
+// ============================================================================
+
+const DATASETS_DIR: &str = "data/datasets";
+
+/// Load all datasets from `data/datasets/*.json` on startup.
+fn load_datasets_from_disk() -> HashMap<String, SheetExtraction> {
+    let dir = std::path::Path::new(DATASETS_DIR);
+    let mut map = HashMap::new();
+
+    if !dir.exists() {
+        return map;
+    }
+
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(e) => {
+            error!("Failed to read datasets dir: {}", e);
+            return map;
+        }
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().map(|e| e == "json").unwrap_or(false) {
+            match std::fs::read_to_string(&path) {
+                Ok(content) => match serde_json::from_str::<SheetExtraction>(&content) {
+                    Ok(ds) => {
+                        info!("Loaded dataset {} from {:?}", ds.id, path);
+                        map.insert(ds.id.clone(), ds);
+                    }
+                    Err(e) => error!("Failed to parse dataset {:?}: {}", path, e),
+                },
+                Err(e) => error!("Failed to read {:?}: {}", path, e),
+            }
+        }
+    }
+
+    map
+}
+
+/// Save a completed dataset to `data/datasets/{id}.json`.
+fn save_dataset_to_disk(dataset: &SheetExtraction) -> anyhow::Result<()> {
+    let dir = std::path::Path::new(DATASETS_DIR);
+    std::fs::create_dir_all(dir)?;
+
+    let path = dir.join(format!("{}.json", dataset.id));
+    let json = serde_json::to_string_pretty(dataset)?;
+    std::fs::write(&path, json)?;
+
+    info!("Persisted dataset {} to {:?}", dataset.id, path);
+    Ok(())
 }
 
 // ============================================================================

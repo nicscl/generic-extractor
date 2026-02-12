@@ -15,6 +15,9 @@ docling-sidecar/uv.lock
 smol-docling-sidecar/*.egg-info/
 smol-docling-sidecar/uv.lock
 
+# Dataset persistence
+data/
+
 # MCP server
 mcp-server/node_modules/
 mcp-server/dist/
