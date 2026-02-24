@@ -44,7 +44,7 @@ impl DoclingProvider {
     }
 
     /// Attempt to convert a document via the Docling sidecar.
-    async fn try_convert(&self, input: &OcrInput) -> anyhow::Result<OcrResult> {
+    async fn try_convert(&self, input: &OcrInput, job_id: Option<&str>) -> anyhow::Result<OcrResult> {
         use reqwest::multipart::{Form, Part};
 
         let (filename, file_data) = match input {
@@ -68,9 +68,15 @@ impl DoclingProvider {
 
         let form = Form::new().part("file", part);
 
+        let convert_url = if let Some(jid) = job_id {
+            format!("{}/convert?job_id={}", self.url, jid)
+        } else {
+            format!("{}/convert", self.url)
+        };
+
         let response = self
             .client
-            .post(format!("{}/convert", self.url))
+            .post(&convert_url)
             .multipart(form)
             .send()
             .await?;
@@ -170,8 +176,13 @@ impl OcrProvider for DoclingProvider {
     }
 
     async fn process(&self, input: &OcrInput) -> anyhow::Result<OcrResult> {
+        self.process_with_job_id(input, "").await
+    }
+
+    async fn process_with_job_id(&self, input: &OcrInput, job_id: &str) -> anyhow::Result<OcrResult> {
+        let jid = if job_id.is_empty() { None } else { Some(job_id) };
         // First attempt
-        match self.try_convert(input).await {
+        match self.try_convert(input, jid).await {
             Ok(result) => return Ok(result),
             Err(err) => {
                 // If it's a connection error and we have GCE config, try to wake the instance
@@ -180,7 +191,7 @@ impl OcrProvider for DoclingProvider {
                         warn!("Docling connection failed, attempting GCE wake-on-demand: {}", err);
                         self.ensure_docling_ready(gce).await?;
                         // Retry after waking
-                        return self.try_convert(input).await;
+                        return self.try_convert(input, jid).await;
                     }
                 }
                 // No GCE config or not a connection error — fail as before

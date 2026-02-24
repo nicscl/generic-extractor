@@ -423,6 +423,7 @@ impl SupabaseClient {
             metadata: row.metadata.unwrap_or(serde_json::Value::Null),
             reference_index: row.reference_index.unwrap_or(serde_json::Value::Null),
             readable_id: row.readable_id,
+            current_step: None,
             children,
         };
 

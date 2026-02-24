@@ -178,6 +178,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/extractions", get(list_extractions))
         .route("/extractions/:id/snapshot", get(get_extraction_snapshot))
         .route("/extractions/:id", get(get_extraction))
+        .route("/extractions/:id/progress", get(get_extraction_progress))
         .route("/extractions/:id/node/:node_id", get(get_node))
         .route("/content/:ref_path", get(get_content))
         .route("/extract-sheet", post(extract_sheet))
@@ -304,6 +305,7 @@ struct ExtractQuery {
     file_url: Option<String>,
     callback_url: Option<String>,
     ocr_provider: Option<String>,
+    readable_id: Option<String>,
 }
 
 /// Upload a document and start async extraction using OCR + LLM.
@@ -385,7 +387,10 @@ async fn extract_document(
     };
 
     // Create a placeholder extraction with status "processing"
-    let extraction = Extraction::new(filename_for_log.clone(), Some(config_name.to_string()));
+    let mut extraction = Extraction::new(filename_for_log.clone(), Some(config_name.to_string()));
+    if let Some(ref rid) = query.readable_id {
+        extraction.readable_id = Some(rid.clone());
+    }
     let extraction_id = extraction.id.clone();
 
     // Store the placeholder in memory
@@ -405,7 +410,13 @@ async fn extract_document(
 
     tokio::spawn(async move {
         // Step 1: Run OCR via the selected provider
-        let ocr_result = match provider.process(&ocr_input).await {
+        {
+            let mut extractions = bg_state.extractions.write().unwrap();
+            if let Some(ext) = extractions.get_mut(&bg_id) {
+                ext.current_step = Some("ocr".to_string());
+            }
+        }
+        let ocr_result = match provider.process_with_job_id(&ocr_input, &bg_id).await {
             Ok(result) => result,
             Err(e) => {
                 error!("OCR ({}) failed for {}: {}", provider.name(), bg_id, e);
@@ -413,6 +424,7 @@ async fn extract_document(
                 if let Some(ext) = extractions.get_mut(&bg_id) {
                     ext.status = ExtractionStatus::Failed;
                     ext.error = Some(format!("OCR ({}) failed: {}", provider.name(), e));
+                    ext.current_step = None;
                 }
                 return;
             }
@@ -425,6 +437,15 @@ async fn extract_document(
             ocr_result.markdown.len(),
             bg_id
         );
+
+        // Update step + total_pages after OCR
+        {
+            let mut extractions = bg_state.extractions.write().unwrap();
+            if let Some(ext) = extractions.get_mut(&bg_id) {
+                ext.current_step = Some("llm".to_string());
+                ext.total_pages = Some(ocr_result.total_pages);
+            }
+        }
 
         // Step 2: Run LLM extraction with OCR output
         let extractor =
@@ -439,6 +460,7 @@ async fn extract_document(
                     if let Some(ext) = extractions.get_mut(&bg_id) {
                         ext.status = ExtractionStatus::Failed;
                         ext.error = Some(format!("Extraction failed: {}", e));
+                        ext.current_step = None;
                     }
                     return;
                 }
@@ -455,6 +477,12 @@ async fn extract_document(
         }
 
         // Upload to Supabase if requested
+        {
+            let mut extractions = bg_state.extractions.write().unwrap();
+            if let Some(ext) = extractions.get_mut(&bg_id) {
+                ext.current_step = Some("uploading".to_string());
+            }
+        }
         if bg_upload {
             if let Some(ref supabase) = bg_state.supabase {
                 match supabase
@@ -500,6 +528,8 @@ struct ExtractionSummary {
     summary: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     readable_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    current_step: Option<String>,
     node_count: usize,
 }
 
@@ -569,6 +599,7 @@ async fn list_extractions(
                 total_pages: e.total_pages,
                 summary: e.summary.clone(),
                 readable_id: e.readable_id.clone(),
+                current_step: e.current_step.clone(),
                 node_count: count_nodes(&e.children),
             })
             .collect()
@@ -591,6 +622,7 @@ async fn list_extractions(
                             total_pages: row.total_pages,
                             summary: row.summary,
                             readable_id: row.readable_id,
+                            current_step: None,
                             node_count: 0, // not hydrated yet
                         });
                     }
@@ -626,6 +658,70 @@ async fn get_extraction(
         .await
         .map(Json)
         .ok_or(StatusCode::NOT_FOUND)
+}
+
+/// Progress response for a processing extraction.
+/// Proxies to the OCR sidecar's /progress endpoint for real-time page info.
+#[derive(serde::Serialize)]
+struct ExtractionProgress {
+    id: String,
+    status: ExtractionStatus,
+    current_step: Option<String>,
+    total_pages: Option<u32>,
+    /// OCR page progress (from smol-docling /progress endpoint)
+    ocr_pages_done: Option<u32>,
+    ocr_total_pages: Option<u32>,
+    ocr_status: Option<String>,
+    ocr_elapsed_s: Option<f64>,
+}
+
+/// Get real-time progress for a processing extraction.
+/// If the extraction is in OCR step, proxies to the docling sidecar for page progress.
+async fn get_extraction_progress(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<ExtractionProgress>, StatusCode> {
+    let (status, current_step, total_pages) = {
+        let extractions = state.extractions.read().unwrap();
+        let ext = extractions.get(&id).ok_or(StatusCode::NOT_FOUND)?;
+        (ext.status.clone(), ext.current_step.clone(), ext.total_pages)
+    };
+
+    let mut progress = ExtractionProgress {
+        id: id.clone(),
+        status,
+        current_step: current_step.clone(),
+        total_pages,
+        ocr_pages_done: None,
+        ocr_total_pages: None,
+        ocr_status: None,
+        ocr_elapsed_s: None,
+    };
+
+    // If in OCR step, try to fetch page progress from the docling sidecar
+    if current_step.as_deref() == Some("ocr") {
+        let docling_url = std::env::var("DOCLING_URL")
+            .unwrap_or_else(|_| "http://localhost:3005".to_string());
+        let progress_url = format!("{}/progress/{}", docling_url, id);
+
+        if let Ok(resp) = state.http_client
+            .get(&progress_url)
+            .timeout(std::time::Duration::from_secs(2))
+            .send()
+            .await
+        {
+            if resp.status().is_success() {
+                if let Ok(body) = resp.json::<serde_json::Value>().await {
+                    progress.ocr_pages_done = body.get("pages_done").and_then(|v| v.as_u64()).map(|v| v as u32);
+                    progress.ocr_total_pages = body.get("total_pages").and_then(|v| v.as_u64()).map(|v| v as u32);
+                    progress.ocr_status = body.get("status").and_then(|v| v.as_str()).map(|s| s.to_string());
+                    progress.ocr_elapsed_s = body.get("elapsed_s").and_then(|v| v.as_f64());
+                }
+            }
+        }
+    }
+
+    Ok(Json(progress))
 }
 
 #[derive(serde::Deserialize)]

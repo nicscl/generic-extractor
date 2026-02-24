@@ -102,6 +102,9 @@ pub struct Extraction {
     /// Human-readable document identifier (e.g. case number, invoice ID)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub readable_id: Option<String>,
+    /// Current processing step: "ocr", "llm", "uploading"
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_step: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub children: Vec<DocumentNode>,
 }
@@ -126,6 +129,7 @@ impl Extraction {
             metadata: serde_json::Value::Null,
             reference_index: serde_json::Value::Null,
             readable_id: None,
+            current_step: None,
             children: Vec::new(),
         }
     }

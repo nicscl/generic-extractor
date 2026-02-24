@@ -36,6 +36,10 @@ pub enum OcrInput {
 pub trait OcrProvider: Send + Sync {
     fn name(&self) -> &str;
     async fn process(&self, input: &OcrInput) -> anyhow::Result<OcrResult>;
+    /// Process with a job_id for progress tracking. Defaults to process() ignoring job_id.
+    async fn process_with_job_id(&self, input: &OcrInput, _job_id: &str) -> anyhow::Result<OcrResult> {
+        self.process(input).await
+    }
 }
 
 /// Known provider identifiers used for registry lookup.

@@ -42,6 +42,10 @@ impl OcrProvider for SmolDoclingProvider {
     }
 
     async fn process(&self, input: &OcrInput) -> anyhow::Result<OcrResult> {
+        self.process_with_job_id(input, "").await
+    }
+
+    async fn process_with_job_id(&self, input: &OcrInput, job_id: &str) -> anyhow::Result<OcrResult> {
         use reqwest::multipart::{Form, Part};
 
         let (filename, file_data) = match input {
@@ -68,9 +72,15 @@ impl OcrProvider for SmolDoclingProvider {
 
         let form = Form::new().part("file", part);
 
+        let convert_url = if job_id.is_empty() {
+            format!("{}/convert", self.url)
+        } else {
+            format!("{}/convert?job_id={}", self.url, job_id)
+        };
+
         let response = self
             .client
-            .post(format!("{}/convert", self.url))
+            .post(&convert_url)
             .multipart(form)
             .send()
             .await?;
