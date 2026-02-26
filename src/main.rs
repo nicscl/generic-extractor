@@ -45,6 +45,8 @@ struct AppState {
     http_client: reqwest::Client,
     supabase: Option<supabase::SupabaseClient>,
     ocr_providers: Arc<HashMap<OcrProviderKind, Arc<dyn OcrProvider>>>,
+    /// Active Docling sidecar URL (updated dynamically when GCE instances start).
+    docling_url: Arc<RwLock<String>>,
 }
 
 #[tokio::main]
@@ -113,16 +115,35 @@ async fn main() -> anyhow::Result<()> {
     );
 
     // Initialize OCR providers
-    let http_client = reqwest::Client::new();
+    let http_client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(900))
+        .build()
+        .expect("failed to build HTTP client");
     let mut ocr_providers: HashMap<OcrProviderKind, Arc<dyn OcrProvider>> = HashMap::new();
 
-    // GCE on-demand config (optional — all 4 env vars must be set)
+    // GCE on-demand config (optional)
+    // Multi-zone: GCE_INSTANCES=zone/name,zone/name,...
+    // Legacy:     GCE_ZONE + GCE_INSTANCE_NAME
+    // Both require: GCE_PROJECT_ID + GCE_SA_KEY_PATH
     let gce_config = gce::GceConfig::from_env();
-    if gce_config.is_some() {
-        info!("GCE on-demand enabled for Docling (will auto-start instance on connection failure)");
+    if let Some(ref gce) = gce_config {
+        info!(
+            "GCE on-demand enabled for Docling ({} instance(s): {})",
+            gce.instances.len(),
+            gce.instances
+                .iter()
+                .map(|i| format!("{}/{}", i.zone, i.instance_name))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
     } else {
-        info!("GCE on-demand disabled (set GCE_PROJECT_ID, GCE_ZONE, GCE_INSTANCE_NAME, GCE_SA_KEY_PATH to enable)");
+        info!("GCE on-demand disabled (set GCE_PROJECT_ID + GCE_INSTANCES or GCE_ZONE/GCE_INSTANCE_NAME to enable)");
     }
+
+    // Shared Docling URL — DoclingProvider updates it, progress handler reads it
+    let docling_url_default =
+        std::env::var("DOCLING_URL").unwrap_or_else(|_| "http://localhost:3001".to_string());
+    let docling_url = Arc::new(RwLock::new(docling_url_default));
 
     // Docling is always available
     ocr_providers.insert(
@@ -130,6 +151,7 @@ async fn main() -> anyhow::Result<()> {
         Arc::new(ocr::docling::DoclingProvider::new(
             http_client.clone(),
             gce_config,
+            docling_url.clone(),
         )),
     );
     info!("OCR provider registered: docling");
@@ -167,6 +189,7 @@ async fn main() -> anyhow::Result<()> {
         http_client,
         supabase,
         ocr_providers: Arc::new(ocr_providers),
+        docling_url,
     };
 
     // Build router
@@ -700,8 +723,7 @@ async fn get_extraction_progress(
 
     // If in OCR step, try to fetch page progress from the docling sidecar
     if current_step.as_deref() == Some("ocr") {
-        let docling_url = std::env::var("DOCLING_URL")
-            .unwrap_or_else(|_| "http://localhost:3005".to_string());
+        let docling_url = state.docling_url.read().unwrap().clone();
         let progress_url = format!("{}/progress/{}", docling_url, id);
 
         if let Ok(resp) = state.http_client

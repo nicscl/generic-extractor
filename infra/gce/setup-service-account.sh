@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
-# Create a minimal service account for starting/stopping the Docling GPU instance.
+# Create a minimal service account for starting/stopping Docling GPU instances.
+# Grants compute.instanceAdmin.v1 scoped to instances named docling-gpu*.
 # Downloads the JSON key to ./docling-starter-key.json.
 #
-# Usage: bash infra/gce/setup-service-account.sh
+# Usage: GCE_PROJECT_ID=your-project bash infra/gce/setup-service-account.sh
 
 set -euo pipefail
 
@@ -20,11 +21,20 @@ else
     echo "    Service account already exists."
 fi
 
-echo "==> Granting compute.instanceAdmin.v1 role..."
+echo "==> Granting compute.instanceAdmin.v1 role (scoped to docling-gpu* instances)..."
+
+# Remove old single-zone binding if it exists (ignore errors)
+gcloud projects remove-iam-policy-binding "$PROJECT" \
+    --member="serviceAccount:${SA_EMAIL}" \
+    --role="roles/compute.instanceAdmin.v1" \
+    --condition="title=docling-gpu-only" \
+    --quiet 2>/dev/null || true
+
+# Add new binding scoped to all instances with "docling-gpu" prefix (any zone)
 gcloud projects add-iam-policy-binding "$PROJECT" \
     --member="serviceAccount:${SA_EMAIL}" \
     --role="roles/compute.instanceAdmin.v1" \
-    --condition="expression=resource.name == 'projects/${PROJECT}/zones/us-central1-a/instances/docling-gpu',title=docling-gpu-only" \
+    --condition="expression=resource.name.startsWith('projects/${PROJECT}/zones/') && resource.name.extract('/instances/{name}').startsWith('docling-gpu'),title=docling-gpu-all-zones" \
     --quiet
 
 echo "==> Generating key file: $KEY_FILE"
