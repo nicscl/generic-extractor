@@ -6,6 +6,7 @@ mod entities;
 mod extractor;
 mod gce;
 mod ocr;
+mod paperspace;
 mod openrouter;
 mod schema;
 mod sheet_extractor;
@@ -45,8 +46,8 @@ struct AppState {
     http_client: reqwest::Client,
     supabase: Option<supabase::SupabaseClient>,
     ocr_providers: Arc<HashMap<OcrProviderKind, Arc<dyn OcrProvider>>>,
-    /// Active Docling sidecar URL (updated dynamically when GCE instances start).
-    docling_url: Arc<RwLock<String>>,
+    /// Docling instance pool with health tracking, backpressure, and job mapping.
+    docling_pool: Arc<ocr::docling::InstancePool>,
 }
 
 #[tokio::main]
@@ -140,21 +141,43 @@ async fn main() -> anyhow::Result<()> {
         info!("GCE on-demand disabled (set GCE_PROJECT_ID + GCE_INSTANCES or GCE_ZONE/GCE_INSTANCE_NAME to enable)");
     }
 
-    // Shared Docling URL — DoclingProvider updates it, progress handler reads it
+    // Paperspace on-demand config (optional)
+    let paperspace_config = paperspace::PaperspaceConfig::from_env();
+    if let Some(ref ps) = paperspace_config {
+        info!(
+            "Paperspace on-demand enabled for Docling (machine_id={})",
+            ps.machine_id
+        );
+    } else {
+        info!("Paperspace on-demand disabled (set PAPERSPACE_API_KEY + PAPERSPACE_MACHINE_ID to enable)");
+    }
+
+    // Docling instance pool with backpressure and auto-discovery
     let docling_url_default =
         std::env::var("DOCLING_URL").unwrap_or_else(|_| "http://localhost:3001".to_string());
-    let docling_url = Arc::new(RwLock::new(docling_url_default));
+    let max_concurrent_per_instance: u32 = std::env::var("DOCLING_MAX_CONCURRENT_PER_INSTANCE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1);
 
-    // Docling is always available
+    let docling_provider = ocr::docling::DoclingProvider::new(
+        http_client.clone(),
+        gce_config,
+        paperspace_config,
+        docling_url_default,
+        max_concurrent_per_instance,
+    );
+    let docling_pool = docling_provider.pool();
+    docling_provider.spawn_health_checker();
+
     ocr_providers.insert(
         OcrProviderKind::Docling,
-        Arc::new(ocr::docling::DoclingProvider::new(
-            http_client.clone(),
-            gce_config,
-            docling_url.clone(),
-        )),
+        Arc::new(docling_provider),
     );
-    info!("OCR provider registered: docling");
+    info!(
+        "OCR provider registered: docling (max_concurrent_per_instance={})",
+        max_concurrent_per_instance
+    );
 
     // Mistral OCR is optional (only if MISTRAL_API_KEY is set)
     match ocr::mistral::MistralOcrProvider::from_env(http_client.clone()) {
@@ -189,7 +212,7 @@ async fn main() -> anyhow::Result<()> {
         http_client,
         supabase,
         ocr_providers: Arc::new(ocr_providers),
-        docling_url,
+        docling_pool,
     };
 
     // Build router
@@ -208,6 +231,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/datasets", get(list_datasets))
         .route("/datasets/:id", get(get_dataset))
         .route("/datasets/:id/rows", get(get_dataset_rows))
+        .route("/docling-pool", get(get_docling_pool_status))
         .layer(DefaultBodyLimit::max(100 * 1024 * 1024)) // 100MB
         .layer(TraceLayer::new_for_http())
         .layer(CorsLayer::permissive())
@@ -721,29 +745,41 @@ async fn get_extraction_progress(
         ocr_elapsed_s: None,
     };
 
-    // If in OCR step, try to fetch page progress from the docling sidecar
+    // If in OCR step, query the correct Docling instance for page progress
     if current_step.as_deref() == Some("ocr") {
-        let docling_url = state.docling_url.read().unwrap().clone();
-        let progress_url = format!("{}/progress/{}", docling_url, id);
+        if let Some(instance_url) = state.docling_pool.job_instance_url(&id) {
+            let progress_url = format!("{}/progress/{}", instance_url, id);
 
-        if let Ok(resp) = state.http_client
-            .get(&progress_url)
-            .timeout(std::time::Duration::from_secs(2))
-            .send()
-            .await
-        {
-            if resp.status().is_success() {
-                if let Ok(body) = resp.json::<serde_json::Value>().await {
-                    progress.ocr_pages_done = body.get("pages_done").and_then(|v| v.as_u64()).map(|v| v as u32);
-                    progress.ocr_total_pages = body.get("total_pages").and_then(|v| v.as_u64()).map(|v| v as u32);
-                    progress.ocr_status = body.get("status").and_then(|v| v.as_str()).map(|s| s.to_string());
-                    progress.ocr_elapsed_s = body.get("elapsed_s").and_then(|v| v.as_f64());
+            if let Ok(resp) = state.http_client
+                .get(&progress_url)
+                .timeout(std::time::Duration::from_secs(2))
+                .send()
+                .await
+            {
+                if resp.status().is_success() {
+                    if let Ok(body) = resp.json::<serde_json::Value>().await {
+                        progress.ocr_pages_done = body.get("pages_done").and_then(|v| v.as_u64()).map(|v| v as u32);
+                        progress.ocr_total_pages = body.get("total_pages").and_then(|v| v.as_u64()).map(|v| v as u32);
+                        progress.ocr_status = body.get("status").and_then(|v| v.as_str()).map(|s| s.to_string());
+                        progress.ocr_elapsed_s = body.get("elapsed_s").and_then(|v| v.as_f64());
+                    }
                 }
             }
         }
     }
 
     Ok(Json(progress))
+}
+
+/// Debug endpoint: show Docling instance pool status.
+async fn get_docling_pool_status(
+    State(state): State<AppState>,
+) -> Json<serde_json::Value> {
+    let instances = state.docling_pool.snapshot();
+    Json(serde_json::json!({
+        "instance_count": instances.len(),
+        "instances": instances,
+    }))
 }
 
 #[derive(serde::Deserialize)]
