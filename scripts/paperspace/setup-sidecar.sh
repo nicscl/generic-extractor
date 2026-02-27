@@ -38,10 +38,12 @@ if ! $SSH_CMD "echo ok" >/dev/null 2>&1; then
 fi
 
 # ---------------------------------------------------------------------------
-# Step 2: Install uv
+# Step 2: Install system dependencies and uv
 # ---------------------------------------------------------------------------
-log "Installing uv..."
+log "Installing system dependencies (libGL, libglib2)..."
 $SSH_CMD bash <<'EOF'
+sudo apt-get update -qq && sudo apt-get install -y -qq libgl1-mesa-glx libglib2.0-0 2>/dev/null || \
+    echo "WARN: Could not install system deps (no sudo?). Docling may fail if libGL is missing."
 if [ -f "$HOME/.local/bin/uv" ]; then
     echo "uv already installed"
 else
@@ -95,6 +97,9 @@ SERVICE
 systemctl --user daemon-reload
 systemctl --user enable docling-sidecar
 systemctl --user restart docling-sidecar
+
+# Enable linger so the user-level service survives reboots
+sudo loginctl enable-linger $(whoami) 2>/dev/null || echo "WARN: Could not enable linger (no sudo?)"
 echo "Service started"
 EOF
 
