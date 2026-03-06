@@ -4,22 +4,23 @@ use crate::config::ExtractionConfig;
 use crate::content_store::ContentStore;
 use crate::entities::{self, CompiledPatterns};
 use crate::ocr::{OcrPage, OcrResult};
-use crate::openrouter::{Message, OpenRouterClient};
+use crate::openrouter::{LlmClient, Message};
 use crate::schema::{
     ConfidenceScores, DocumentNode, EmbeddedReference, Extraction, Relationship, StructureMapEntry,
 };
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
+use std::sync::Arc;
 use tracing::{debug, info};
 
 /// Extraction pipeline orchestrator.
 pub struct Extractor {
-    client: OpenRouterClient,
+    client: Arc<dyn LlmClient>,
     content_store: ContentStore,
 }
 
 impl Extractor {
-    pub fn new(client: OpenRouterClient, content_store: ContentStore) -> Self {
+    pub fn new(client: Arc<dyn LlmClient>, content_store: ContentStore) -> Self {
         Self {
             client,
             content_store,

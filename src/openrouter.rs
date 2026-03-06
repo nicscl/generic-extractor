@@ -2,14 +2,28 @@
 //! OpenRouter API client for LLM interactions.
 
 use anyhow::{Context, Result};
+use async_trait::async_trait;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::env;
 use tracing::{debug, info};
 
+/// Trait for LLM chat backends (OpenRouter, agent-cli-api, etc.).
+#[async_trait]
+pub trait LlmClient: Send + Sync {
+    async fn chat(&self, messages: Vec<Message>) -> Result<String>;
+}
+
+#[async_trait]
+impl LlmClient for OpenRouterClient {
+    async fn chat(&self, messages: Vec<Message>) -> Result<String> {
+        self.chat(messages).await
+    }
+}
+
 const OPENROUTER_API_URL: &str = "https://openrouter.ai/api/v1/chat/completions";
-const DEFAULT_MODEL: &str = "google/gemini-3-flash-preview";
+const DEFAULT_MODEL: &str = "google/gemini-3.1-flash-lite-preview";
 
 /// OpenRouter client for chat completions.
 #[derive(Clone)]

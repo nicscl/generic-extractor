@@ -4,7 +4,8 @@
 //! schemas, defines column types, and classifies rows.
 
 use crate::config::ExtractionConfig;
-use crate::openrouter::{Message, OpenRouterClient};
+use crate::openrouter::{LlmClient, Message};
+use std::sync::Arc;
 use crate::sheet_parser::RawSheet;
 use crate::sheet_schema::{ColumnDef, DataSchema, SchemaRelationship, SheetExtraction};
 use anyhow::{Context, Result};
@@ -15,11 +16,11 @@ const MAX_SAMPLE_ROWS: usize = 50;
 
 /// Sheet extraction pipeline orchestrator.
 pub struct SheetExtractor {
-    client: OpenRouterClient,
+    client: Arc<dyn LlmClient>,
 }
 
 impl SheetExtractor {
-    pub fn new(client: OpenRouterClient) -> Self {
+    pub fn new(client: Arc<dyn LlmClient>) -> Self {
         Self { client }
     }
 

@@ -9,7 +9,9 @@ import asyncio
 import logging
 import os
 import pathlib
+import signal
 import tempfile
+import threading
 import time
 import uuid
 from typing import Any
@@ -27,6 +29,13 @@ app = FastAPI(
     description="PDF processing service using Docling",
     version="0.1.0",
 )
+
+# Concurrency limit — prevents duplicate/parallel jobs from grinding the CPU
+MAX_CONCURRENT = int(os.environ.get("DOCLING_MAX_CONCURRENT", "1"))
+_conversion_sem = asyncio.Semaphore(MAX_CONCURRENT)
+
+# Track threads running conversions (job_id -> thread ident)
+_active_threads: dict[str, int] = {}
 
 # Activity tracking for idle-shutdown (GCE auto-stop)
 ACTIVITY_FILE = pathlib.Path("/tmp/docling_last_activity")
@@ -129,6 +138,46 @@ async def get_progress(job_id: str):
     )
 
 
+@app.post("/cancel/{job_id}")
+async def cancel_job(job_id: str):
+    """Cancel a specific running conversion. Best-effort thread kill."""
+    tid = _active_threads.get(job_id)
+    if not tid:
+        j = _jobs.get(job_id)
+        if j and j.get("status") in ("completed", "failed"):
+            return {"status": "already_finished", "job_id": job_id}
+        raise HTTPException(status_code=404, detail="Job not found or not running")
+
+    import ctypes
+    ctypes.pythonapi.PyThreadState_SetAsyncExc(
+        ctypes.c_ulong(tid), ctypes.py_object(SystemExit)
+    )
+    _active_threads.pop(job_id, None)
+    if job_id in _jobs:
+        _jobs[job_id]["status"] = "cancelled"
+    logger.info(f"Cancelled job {job_id} (thread {tid})")
+    return {"status": "cancelled", "job_id": job_id}
+
+
+@app.post("/cancel-all")
+async def cancel_all():
+    """Kill ALL running conversions by restarting the sidecar process.
+
+    This is the nuclear option — converter.convert() is a blocking C call
+    that can't be interrupted from Python. The startup wrapper auto-restarts us.
+    """
+    cancelled = list(_active_threads.keys())
+    logger.warning(f"cancel-all: killing {len(cancelled)} jobs, restarting process")
+
+    # Schedule hard exit after giving time for the HTTP response
+    async def _exit():
+        await asyncio.sleep(0.3)
+        os._exit(0)
+
+    asyncio.ensure_future(_exit())
+    return {"status": "restarting", "cancelled": cancelled}
+
+
 @app.post("/convert", response_model=ConversionResult)
 async def convert_document(
     file: UploadFile = File(...),
@@ -160,8 +209,9 @@ async def convert_document(
     }
 
     try:
-        result = await asyncio.to_thread(_convert_blocking, content, file.filename, jid)
-        return result
+        async with _conversion_sem:
+            result = await asyncio.to_thread(_convert_blocking, content, file.filename, jid)
+            return result
     except HTTPException:
         raise
     except Exception as e:
@@ -174,6 +224,7 @@ def _convert_blocking(content: bytes, filename: str, jid: str) -> ConversionResu
     """Run the Docling pipeline in a worker thread so the event loop stays free."""
     import os
 
+    _active_threads[jid] = threading.current_thread().ident
     converter = get_converter()
     _jobs[jid]["status"] = "converting"
 
@@ -256,6 +307,7 @@ def _convert_blocking(content: bytes, filename: str, jid: str) -> ConversionResu
         )
 
     finally:
+        _active_threads.pop(jid, None)
         os.unlink(tmp_path)
 
 

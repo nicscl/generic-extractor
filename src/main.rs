@@ -1,5 +1,6 @@
 //! Generic Extractor - Config-driven hierarchical document extraction server.
 
+mod agent_cli;
 mod config;
 mod content_store;
 mod entities;
@@ -25,7 +26,7 @@ use config::ConfigStore;
 use content_store::{ContentChunk, ContentStore};
 use extractor::Extractor;
 use ocr::{OcrInput, OcrProvider, OcrProviderKind};
-use openrouter::OpenRouterClient;
+use openrouter::{LlmClient, OpenRouterClient};
 use schema::{Extraction, ExtractionStatus};
 use sheet_schema::SheetExtraction;
 use std::collections::{HashMap, HashSet};
@@ -41,7 +42,7 @@ struct AppState {
     extractions: Arc<RwLock<HashMap<String, Extraction>>>,
     datasets: Arc<RwLock<HashMap<String, SheetExtraction>>>,
     content_store: ContentStore,
-    openrouter: Arc<OpenRouterClient>,
+    llm: Arc<dyn LlmClient>,
     configs: Arc<ConfigStore>,
     http_client: reqwest::Client,
     supabase: Option<supabase::SupabaseClient>,
@@ -64,9 +65,18 @@ async fn main() -> anyhow::Result<()> {
         .with(tracing_subscriber::fmt::layer())
         .init();
 
-    // Initialize OpenRouter client
-    let openrouter = OpenRouterClient::from_env()?;
-    info!("OpenRouter client initialized");
+    // Initialize LLM backend
+    let llm_backend = std::env::var("LLM_BACKEND").unwrap_or_else(|_| "openrouter".into());
+    let llm: Arc<dyn LlmClient> = match llm_backend.as_str() {
+        "agent-cli" | "claude" => {
+            info!("LLM backend: agent-cli-api");
+            Arc::new(agent_cli::AgentCliClient::from_env()?)
+        }
+        _ => {
+            info!("LLM backend: openrouter");
+            Arc::new(OpenRouterClient::from_env()?)
+        }
+    };
 
     // Initialize Supabase client (optional)
     let supabase = match supabase::SupabaseClient::from_env() {
@@ -207,7 +217,7 @@ async fn main() -> anyhow::Result<()> {
         extractions: Arc::new(RwLock::new(HashMap::new())),
         datasets: Arc::new(RwLock::new(datasets)),
         content_store: ContentStore::new(),
-        openrouter: Arc::new(openrouter),
+        llm,
         configs: Arc::new(configs),
         http_client,
         supabase,
@@ -496,7 +506,7 @@ async fn extract_document(
 
         // Step 2: Run LLM extraction with OCR output
         let extractor =
-            Extractor::new((*bg_state.openrouter).clone(), bg_state.content_store.clone());
+            Extractor::new(bg_state.llm.clone(), bg_state.content_store.clone());
 
         let mut completed =
             match extractor.extract(&filename_for_log, &ocr_result, &bg_config).await {
@@ -1071,7 +1081,7 @@ async fn extract_sheet(
         );
 
         // Step 2: LLM schema discovery
-        let extractor = sheet_extractor::SheetExtractor::new((*bg_state.openrouter).clone());
+        let extractor = sheet_extractor::SheetExtractor::new(bg_state.llm.clone());
         let mut completed = match extractor.extract(&filename, &sheets, &bg_config).await {
             Ok(ext) => ext,
             Err(e) => {
