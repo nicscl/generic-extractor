@@ -32,6 +32,14 @@ pub struct ExtractionConfig {
     /// Sheet extraction config (for tabular data pipelines).
     #[serde(default)]
     pub sheet_config: Option<SheetConfig>,
+    /// LLM backend override for this config. If `None`, uses the global default.
+    /// Valid values: "openrouter", "agent-cli" / "claude".
+    #[serde(default)]
+    pub llm_backend: Option<String>,
+    /// OCR backend override for this config. If `None`, uses the global default.
+    /// Valid values: "docling", "mistral_ocr", "smol_docling".
+    #[serde(default)]
+    pub ocr_backend: Option<String>,
 }
 
 /// Configuration for sheet/tabular data extraction.
@@ -249,5 +257,7 @@ Return a JSON object with:
         entity_patterns: Vec::new(),
         readable_id_hint: None,
         sheet_config: None,
+        llm_backend: None,
+        ocr_backend: None,
     }
 }

@@ -36,17 +36,104 @@ use tower_http::trace::TraceLayer;
 use tracing::{debug, error, info};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
+/// Registry of all available LLM backends, keyed by name.
+#[derive(Clone)]
+struct LlmRegistry {
+    backends: Arc<HashMap<String, Arc<dyn LlmClient>>>,
+    default_backend: String,
+}
+
+impl LlmRegistry {
+    /// Resolve which LLM client to use: config override → global default.
+    fn resolve(&self, config: &config::ExtractionConfig) -> Arc<dyn LlmClient> {
+        let key = config
+            .llm_backend
+            .as_deref()
+            .unwrap_or(&self.default_backend);
+        // Normalize "claude" alias
+        let key = match key {
+            "claude" => "agent-cli",
+            other => other,
+        };
+        self.backends
+            .get(key)
+            .cloned()
+            .unwrap_or_else(|| {
+                tracing::warn!(
+                    "Config '{}' requested backend '{}' which is not available, falling back to '{}'",
+                    config.name,
+                    key,
+                    self.default_backend
+                );
+                self.backends[&self.default_backend].clone()
+            })
+    }
+
+    /// List available backend names.
+    fn available(&self) -> Vec<String> {
+        self.backends.keys().cloned().collect()
+    }
+}
+
+/// Registry of all available OCR backends, keyed by provider kind.
+#[derive(Clone)]
+struct OcrRegistry {
+    providers: Arc<HashMap<OcrProviderKind, Arc<dyn OcrProvider>>>,
+    default_backend: String,
+}
+
+impl OcrRegistry {
+    /// Resolve which OCR provider to use: query param → config override → global default.
+    fn resolve(
+        &self,
+        config: &config::ExtractionConfig,
+        query_override: Option<&str>,
+    ) -> Result<Arc<dyn OcrProvider>, String> {
+        let key = query_override
+            .or(config.ocr_backend.as_deref())
+            .unwrap_or(&self.default_backend);
+
+        let kind = OcrProviderKind::from_str(key).ok_or_else(|| {
+            format!(
+                "Unknown OCR provider: '{}'. Available: {}",
+                key,
+                self.available().join(", ")
+            )
+        })?;
+
+        self.providers.get(&kind).cloned().ok_or_else(|| {
+            format!(
+                "OCR provider '{}' is not configured. Check env vars.",
+                key
+            )
+        })
+    }
+
+    /// List available provider names.
+    fn available(&self) -> Vec<String> {
+        self.providers
+            .keys()
+            .map(|k| match k {
+                OcrProviderKind::Docling => "docling",
+                OcrProviderKind::MistralOcr => "mistral_ocr",
+                OcrProviderKind::SmolDocling => "smol_docling",
+            })
+            .map(String::from)
+            .collect()
+    }
+}
+
 /// Application state shared across handlers.
 #[derive(Clone)]
 struct AppState {
     extractions: Arc<RwLock<HashMap<String, Extraction>>>,
     datasets: Arc<RwLock<HashMap<String, SheetExtraction>>>,
     content_store: ContentStore,
-    llm: Arc<dyn LlmClient>,
+    llm: LlmRegistry,
+    ocr: OcrRegistry,
     configs: Arc<ConfigStore>,
     http_client: reqwest::Client,
     supabase: Option<supabase::SupabaseClient>,
-    ocr_providers: Arc<HashMap<OcrProviderKind, Arc<dyn OcrProvider>>>,
     /// Docling instance pool with health tracking, backpressure, and job mapping.
     docling_pool: Arc<ocr::docling::InstancePool>,
 }
@@ -65,17 +152,50 @@ async fn main() -> anyhow::Result<()> {
         .with(tracing_subscriber::fmt::layer())
         .init();
 
-    // Initialize LLM backend
-    let llm_backend = std::env::var("LLM_BACKEND").unwrap_or_else(|_| "openrouter".into());
-    let llm: Arc<dyn LlmClient> = match llm_backend.as_str() {
-        "agent-cli" | "claude" => {
-            info!("LLM backend: agent-cli-api");
-            Arc::new(agent_cli::AgentCliClient::from_env()?)
+    // Initialize LLM backend registry — all available backends are loaded,
+    // LLM_BACKEND env var selects the default.
+    let default_backend = std::env::var("LLM_BACKEND").unwrap_or_else(|_| "openrouter".into());
+    let default_backend = match default_backend.as_str() {
+        "claude" => "agent-cli".to_string(),
+        other => other.to_string(),
+    };
+
+    let mut llm_backends: HashMap<String, Arc<dyn LlmClient>> = HashMap::new();
+
+    // Always try to load OpenRouter
+    match OpenRouterClient::from_env() {
+        Ok(client) => {
+            info!("LLM backend registered: openrouter");
+            llm_backends.insert("openrouter".to_string(), Arc::new(client));
         }
-        _ => {
-            info!("LLM backend: openrouter");
-            Arc::new(OpenRouterClient::from_env()?)
+        Err(e) => {
+            info!("LLM backend skipped: openrouter ({})", e);
         }
+    }
+
+    // Always try to load Agent-CLI
+    match agent_cli::AgentCliClient::from_env() {
+        Ok(client) => {
+            info!("LLM backend registered: agent-cli");
+            llm_backends.insert("agent-cli".to_string(), Arc::new(client));
+        }
+        Err(e) => {
+            info!("LLM backend skipped: agent-cli ({})", e);
+        }
+    }
+
+    if !llm_backends.contains_key(&default_backend) {
+        anyhow::bail!(
+            "Default LLM backend '{}' is not available. Available: {:?}",
+            default_backend,
+            llm_backends.keys().collect::<Vec<_>>()
+        );
+    }
+    info!("LLM default backend: {}", default_backend);
+
+    let llm = LlmRegistry {
+        backends: Arc::new(llm_backends),
+        default_backend,
     };
 
     // Initialize Supabase client (optional)
@@ -212,16 +332,24 @@ async fn main() -> anyhow::Result<()> {
     let datasets = load_datasets_from_disk();
     info!("Loaded {} dataset(s) from data/datasets/", datasets.len());
 
+    // Initialize OCR registry
+    let default_ocr = std::env::var("OCR_BACKEND").unwrap_or_else(|_| "docling".into());
+    info!("OCR default backend: {}", default_ocr);
+    let ocr = OcrRegistry {
+        providers: Arc::new(ocr_providers),
+        default_backend: default_ocr,
+    };
+
     // Build application state
     let state = AppState {
         extractions: Arc::new(RwLock::new(HashMap::new())),
         datasets: Arc::new(RwLock::new(datasets)),
         content_store: ContentStore::new(),
         llm,
+        ocr,
         configs: Arc::new(configs),
         http_client,
         supabase,
-        ocr_providers: Arc::new(ocr_providers),
         docling_pool,
     };
 
@@ -394,27 +522,11 @@ async fn extract_document(
     })?;
     let config = Arc::new(config);
 
-    // Resolve OCR provider
-    let provider_name = query.ocr_provider.as_deref().unwrap_or("docling");
-    let provider_kind = OcrProviderKind::from_str(provider_name).ok_or_else(|| {
-        (
-            StatusCode::BAD_REQUEST,
-            format!(
-                "Unknown ocr_provider: '{}'. Available: docling, mistral_ocr, smol_docling",
-                provider_name
-            ),
-        )
-    })?;
-    let provider = state.ocr_providers.get(&provider_kind).ok_or_else(|| {
-        (
-            StatusCode::BAD_REQUEST,
-            format!(
-                "OCR provider '{}' is not configured. Check env vars.",
-                provider_name
-            ),
-        )
-    })?;
-    let provider = Arc::clone(provider);
+    // Resolve OCR provider: query param → config → global default
+    let provider = state
+        .ocr
+        .resolve(&config, query.ocr_provider.as_deref())
+        .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
 
     // Read file input from multipart or URL
     let (filename_for_log, file_data) =
@@ -424,7 +536,7 @@ async fn extract_document(
     let ocr_input = if let Some(file_url) = &query.file_url {
         info!(
             "Received file_url: {} (ocr_provider={})",
-            file_url, provider_name
+            file_url, provider.name()
         );
         OcrInput::Url {
             filename: filename_for_log.clone(),
@@ -435,7 +547,7 @@ async fn extract_document(
             "Received file: {} ({} bytes, ocr_provider={})",
             filename_for_log,
             file_data.len(),
-            provider_name
+            provider.name()
         );
         OcrInput::Bytes {
             filename: filename_for_log.clone(),
@@ -505,8 +617,11 @@ async fn extract_document(
         }
 
         // Step 2: Run LLM extraction with OCR output
+        let llm_client = bg_state.llm.resolve(&bg_config);
+        info!("Using LLM backend for config '{}': {}", bg_config.name,
+              bg_config.llm_backend.as_deref().unwrap_or("(default)"));
         let extractor =
-            Extractor::new(bg_state.llm.clone(), bg_state.content_store.clone());
+            Extractor::new(llm_client, bg_state.content_store.clone());
 
         let mut completed =
             match extractor.extract(&filename_for_log, &ocr_result, &bg_config).await {
@@ -953,28 +1068,13 @@ async fn extract_sheet(
         .to_lowercase();
     let is_pdf = ext == "pdf";
 
-    // For PDFs, resolve OCR provider
+    // For PDFs, resolve OCR provider: query param → config → global default
     let ocr_provider = if is_pdf {
-        let provider_name = query.ocr_provider.as_deref().unwrap_or("docling");
-        let provider_kind = OcrProviderKind::from_str(provider_name).ok_or_else(|| {
-            (
-                StatusCode::BAD_REQUEST,
-                format!(
-                    "Unknown ocr_provider: '{}'. Available: docling, mistral_ocr, smol_docling",
-                    provider_name
-                ),
-            )
-        })?;
-        let provider = state.ocr_providers.get(&provider_kind).ok_or_else(|| {
-            (
-                StatusCode::BAD_REQUEST,
-                format!(
-                    "OCR provider '{}' is not configured. Check env vars.",
-                    provider_name
-                ),
-            )
-        })?;
-        Some(Arc::clone(provider))
+        let provider = state
+            .ocr
+            .resolve(&config, query.ocr_provider.as_deref())
+            .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+        Some(provider)
     } else {
         None
     };
@@ -1081,7 +1181,10 @@ async fn extract_sheet(
         );
 
         // Step 2: LLM schema discovery
-        let extractor = sheet_extractor::SheetExtractor::new(bg_state.llm.clone());
+        let llm_client = bg_state.llm.resolve(&bg_config);
+        info!("Using LLM backend for config '{}': {}", bg_config.name,
+              bg_config.llm_backend.as_deref().unwrap_or("(default)"));
+        let extractor = sheet_extractor::SheetExtractor::new(llm_client);
         let mut completed = match extractor.extract(&filename, &sheets, &bg_config).await {
             Ok(ext) => ext,
             Err(e) => {
