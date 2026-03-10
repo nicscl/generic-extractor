@@ -1,0 +1,7 @@
+# Ignore test documents and output
+*.pdf
+*.png
+*.jpg
+*.jpeg
+*.tiff
+output/

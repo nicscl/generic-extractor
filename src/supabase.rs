@@ -425,6 +425,7 @@ impl SupabaseClient {
             readable_id: row.readable_id,
             current_step: None,
             children,
+            raw_markdown: None,
         };
 
         info!(

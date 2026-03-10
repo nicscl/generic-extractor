@@ -4,6 +4,7 @@
 //! (Docling sidecar, Mistral OCR, etc.) can be swapped via query parameter.
 
 pub mod docling;
+pub mod gemini;
 pub mod mistral;
 pub mod smol_docling;
 
@@ -46,6 +47,7 @@ pub trait OcrProvider: Send + Sync {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum OcrProviderKind {
     Docling,
+    GeminiOcr,
     MistralOcr,
     SmolDocling,
 }
@@ -55,6 +57,7 @@ impl OcrProviderKind {
     pub fn from_str(s: &str) -> Option<Self> {
         match s {
             "docling" => Some(Self::Docling),
+            "gemini_ocr" | "gemini" => Some(Self::GeminiOcr),
             "mistral_ocr" => Some(Self::MistralOcr),
             "smol_docling" => Some(Self::SmolDocling),
             _ => None,

@@ -107,6 +107,9 @@ pub struct Extraction {
     pub current_step: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub children: Vec<DocumentNode>,
+    /// Full raw OCR markdown (only included when requested via ?include_raw=true)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw_markdown: Option<String>,
 }
 
 impl Extraction {
@@ -131,6 +134,7 @@ impl Extraction {
             readable_id: None,
             current_step: None,
             children: Vec::new(),
+            raw_markdown: None,
         }
     }
 }

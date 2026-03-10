@@ -115,6 +115,7 @@ impl OcrRegistry {
             .keys()
             .map(|k| match k {
                 OcrProviderKind::Docling => "docling",
+                OcrProviderKind::GeminiOcr => "gemini_ocr",
                 OcrProviderKind::MistralOcr => "mistral_ocr",
                 OcrProviderKind::SmolDocling => "smol_docling",
             })
@@ -326,6 +327,17 @@ async fn main() -> anyhow::Result<()> {
         info!("OCR provider registered: smol_docling");
     } else {
         info!("OCR provider skipped: smol_docling (SMOL_DOCLING_URL not set)");
+    }
+
+    // Gemini OCR is optional (only if GEMINI_API_KEY is set)
+    match ocr::gemini::GeminiOcrProvider::from_env(http_client.clone()) {
+        Ok(provider) => {
+            ocr_providers.insert(OcrProviderKind::GeminiOcr, Arc::new(provider));
+            info!("OCR provider registered: gemini_ocr");
+        }
+        Err(_) => {
+            info!("OCR provider skipped: gemini_ocr (GEMINI_API_KEY not set)");
+        }
     }
 
     // Load persisted datasets from disk
@@ -607,6 +619,10 @@ async fn extract_document(
             bg_id
         );
 
+        // Store raw OCR markdown in content store (keyed by _raw_{id})
+        let raw_key = format!("_raw_{}", bg_id);
+        bg_state.content_store.store(&raw_key, ocr_result.markdown.clone());
+
         // Update step + total_pages after OCR
         {
             let mut extractions = bg_state.extractions.write().unwrap();
@@ -821,15 +837,30 @@ async fn list_extractions(
     Json(list)
 }
 
+/// Query params for get_extraction endpoint.
+#[derive(serde::Deserialize)]
+struct ExtractionQuery {
+    /// Include full raw OCR markdown in response (default: false)
+    include_raw: Option<bool>,
+}
+
 /// Get an extraction by ID (in-memory + Supabase fallback).
 async fn get_extraction(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    Query(query): Query<ExtractionQuery>,
 ) -> Result<Json<Extraction>, StatusCode> {
-    get_or_hydrate_extraction(&state, &id)
+    let mut extraction = get_or_hydrate_extraction(&state, &id)
         .await
-        .map(Json)
-        .ok_or(StatusCode::NOT_FOUND)
+        .ok_or(StatusCode::NOT_FOUND)?;
+
+    // Include raw markdown if requested
+    if query.include_raw.unwrap_or(false) {
+        let raw_key = format!("content://_raw_{}", id);
+        extraction.raw_markdown = state.content_store.get_full(&raw_key);
+    }
+
+    Ok(Json(extraction))
 }
 
 /// Progress response for a processing extraction.
