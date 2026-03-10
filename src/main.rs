@@ -623,12 +623,13 @@ async fn extract_document(
         let raw_key = format!("_raw_{}", bg_id);
         bg_state.content_store.store(&raw_key, ocr_result.markdown.clone());
 
-        // Update step + total_pages after OCR
+        // Update step + total_pages + ocr_metadata after OCR
         {
             let mut extractions = bg_state.extractions.write().unwrap();
             if let Some(ext) = extractions.get_mut(&bg_id) {
                 ext.current_step = Some("llm".to_string());
                 ext.total_pages = Some(ocr_result.total_pages);
+                ext.ocr_metadata = ocr_result.metadata.clone();
             }
         }
 
@@ -654,9 +655,10 @@ async fn extract_document(
                 }
             };
 
-        // Preserve the original ID (extractor.extract creates a new one)
+        // Preserve the original ID and OCR metadata (extractor.extract creates a new one)
         completed.id = bg_id.clone();
         completed.status = ExtractionStatus::Completed;
+        completed.ocr_metadata = ocr_result.metadata.clone();
 
         // Store completed extraction in memory
         {

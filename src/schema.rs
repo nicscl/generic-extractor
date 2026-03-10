@@ -110,6 +110,9 @@ pub struct Extraction {
     /// Full raw OCR markdown (only included when requested via ?include_raw=true)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub raw_markdown: Option<String>,
+    /// OCR provider metadata (tokens, cost, finish_reason)
+    #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
+    pub ocr_metadata: serde_json::Value,
 }
 
 impl Extraction {
@@ -135,6 +138,7 @@ impl Extraction {
             current_step: None,
             children: Vec::new(),
             raw_markdown: None,
+            ocr_metadata: serde_json::Value::Null,
         }
     }
 }

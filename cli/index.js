@@ -218,6 +218,26 @@ async function saveAndDisplayResult(result, originalFile, outputPath) {
       }
     }
   }
+
+  // Display OCR metadata if present
+  if (result.ocr_metadata && Object.keys(result.ocr_metadata).length > 0) {
+    const ocr = result.ocr_metadata;
+    console.log(chalk.blue("\nOCR Info"));
+    console.log(chalk.gray("─".repeat(40)));
+    console.log(`${chalk.cyan("Provider")}: ${ocr.provider || "unknown"} (${ocr.model || "?"})`);
+    if (ocr.token_usage) {
+      const t = ocr.token_usage;
+      console.log(`${chalk.cyan("Tokens")}: ${t.prompt_tokens?.toLocaleString() || 0} in / ${t.output_tokens?.toLocaleString() || 0} out`);
+    }
+    if (ocr.cost_usd !== undefined) {
+      console.log(`${chalk.cyan("Cost")}: $${ocr.cost_usd.toFixed(4)}`);
+    }
+    if (ocr.finish_reason) {
+      const reason = ocr.finish_reason;
+      const color = reason === "STOP" ? chalk.green : chalk.yellow;
+      console.log(`${chalk.cyan("Status")}: ${color(reason)}`);
+    }
+  }
 }
 
 function displayTree(nodes, depth) {

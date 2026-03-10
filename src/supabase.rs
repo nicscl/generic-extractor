@@ -426,6 +426,7 @@ impl SupabaseClient {
             current_step: None,
             children,
             raw_markdown: None,
+            ocr_metadata: serde_json::Value::Null,
         };
 
         info!(

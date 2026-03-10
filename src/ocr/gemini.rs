@@ -64,11 +64,25 @@ struct GenerationConfig {
 #[derive(Deserialize)]
 struct GenerateContentResponse {
     candidates: Vec<Candidate>,
+    #[serde(rename = "usageMetadata")]
+    usage_metadata: Option<UsageMetadata>,
+}
+
+#[derive(Deserialize, Debug, Clone)]
+struct UsageMetadata {
+    #[serde(rename = "promptTokenCount")]
+    prompt_token_count: Option<u32>,
+    #[serde(rename = "candidatesTokenCount")]
+    candidates_token_count: Option<u32>,
+    #[serde(rename = "totalTokenCount")]
+    total_token_count: Option<u32>,
 }
 
 #[derive(Deserialize)]
 struct Candidate {
     content: CandidateContent,
+    #[serde(rename = "finishReason", default)]
+    finish_reason: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -185,10 +199,30 @@ impl OcrProvider for GeminiOcrProvider {
         let pages = parse_pages_from_markdown(&markdown);
         let total_pages = if pages.is_empty() { 1 } else { pages.len() as u32 };
 
+        // Extract token usage and finish reason
+        let usage = response.usage_metadata.clone();
+        let prompt_tokens = usage.as_ref().and_then(|u| u.prompt_token_count).unwrap_or(0);
+        let output_tokens = usage.as_ref().and_then(|u| u.candidates_token_count).unwrap_or(0);
+        let total_tokens = usage.as_ref().and_then(|u| u.total_token_count).unwrap_or(0);
+        let finish_reason = response
+            .candidates
+            .first()
+            .and_then(|c| c.finish_reason.clone())
+            .unwrap_or_else(|| "unknown".to_string());
+
+        // Gemini 3.1 Flash Lite pricing (USD per 1M tokens)
+        // Input: $0.25, Output: $1.50
+        let cost_usd = (prompt_tokens as f64 * 0.25 / 1_000_000.0)
+            + (output_tokens as f64 * 1.50 / 1_000_000.0);
+
         info!(
-            "GeminiOcrProvider: extracted {} pages, {} chars",
+            "GeminiOcrProvider: extracted {} pages, {} chars (tokens: {} in, {} out | cost: ${:.6} | reason: {})",
             total_pages,
-            markdown.len()
+            markdown.len(),
+            prompt_tokens,
+            output_tokens,
+            cost_usd,
+            finish_reason
         );
 
         Ok(OcrResult {
@@ -197,7 +231,14 @@ impl OcrProvider for GeminiOcrProvider {
             total_pages,
             metadata: serde_json::json!({
                 "model": self.model,
-                "provider": "gemini"
+                "provider": "gemini",
+                "finish_reason": finish_reason,
+                "token_usage": {
+                    "prompt_tokens": prompt_tokens,
+                    "output_tokens": output_tokens,
+                    "total_tokens": total_tokens
+                },
+                "cost_usd": cost_usd
             }),
             ocr_confidence: 0.90,
             provider_name: "gemini_ocr".to_string(),
