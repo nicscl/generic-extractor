@@ -373,6 +373,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/configs/:name", get(get_config).put(update_config).delete(delete_config))
         .route("/extract", post(extract_document))
         .route("/sections", post(detect_sections))
+        .route("/pages", post(extract_pages))
         .route("/extractions", get(list_extractions))
         .route("/extractions/:id/snapshot", get(get_extraction_snapshot))
         .route("/extractions/:id", get(get_extraction))
@@ -518,6 +519,72 @@ struct SectionsQuery {
     mode: Option<String>,
     /// Model for page-by-page mode (default: gemini-2.5-flash-lite-preview)
     model: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct PagesQuery {
+    config: Option<String>,
+    file_url: Option<String>,
+    ocr_provider: Option<String>,
+}
+
+/// Extract per-page OCR content from a document.
+/// Returns each page's text content separately for saving to individual files.
+async fn extract_pages(
+    State(state): State<AppState>,
+    Query(query): Query<PagesQuery>,
+    multipart: Option<Multipart>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    // Get config (just for OCR provider resolution)
+    let config_name = query.config.as_deref().unwrap_or("legal_br");
+    let config = state.configs.get(config_name).ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("Unknown config: {}", config_name),
+        )
+    })?;
+    let config = Arc::new(config);
+
+    // Resolve OCR provider
+    let provider = state
+        .ocr
+        .resolve(&config, query.ocr_provider.as_deref())
+        .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+
+    // Read file input
+    let (filename, file_data) = read_file_input(multipart, query.file_url.as_deref()).await?;
+
+    info!("Page extraction for {} (ocr={})", filename, provider.name());
+
+    // Build OCR input
+    let ocr_input = if let Some(file_url) = &query.file_url {
+        OcrInput::Url {
+            filename: filename.clone(),
+            url: file_url.clone(),
+        }
+    } else {
+        OcrInput::Bytes {
+            filename: filename.clone(),
+            data: file_data,
+        }
+    };
+
+    // Run OCR
+    let ocr_result = provider
+        .process(&ocr_input)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("OCR failed: {}", e)))?;
+
+    // Return pages
+    Ok(Json(serde_json::json!({
+        "filename": filename,
+        "total_pages": ocr_result.total_pages,
+        "pages": ocr_result.pages.iter().map(|p| serde_json::json!({
+            "page_num": p.page_num,
+            "text": p.text
+        })).collect::<Vec<_>>(),
+        "metadata": ocr_result.metadata
+    })))
 }
 
 /// Lightweight document section detection.
