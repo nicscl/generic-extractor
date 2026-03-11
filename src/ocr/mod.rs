@@ -5,6 +5,7 @@
 
 pub mod docling;
 pub mod gemini;
+pub mod gemini_pages;
 pub mod mistral;
 pub mod smol_docling;
 
@@ -48,6 +49,7 @@ pub trait OcrProvider: Send + Sync {
 pub enum OcrProviderKind {
     Docling,
     GeminiOcr,
+    GeminiOcrPages,
     MistralOcr,
     SmolDocling,
 }
@@ -58,6 +60,7 @@ impl OcrProviderKind {
         match s {
             "docling" => Some(Self::Docling),
             "gemini_ocr" | "gemini" => Some(Self::GeminiOcr),
+            "gemini_ocr_pages" | "gemini_pages" => Some(Self::GeminiOcrPages),
             "mistral_ocr" => Some(Self::MistralOcr),
             "smol_docling" => Some(Self::SmolDocling),
             _ => None,

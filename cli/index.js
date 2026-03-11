@@ -45,7 +45,7 @@ program
   .command("pages <file>")
   .description("Extract each page separately and save to a folder")
   .option("-c, --config <name>", "Extraction config to use", "legal_br")
-  .option("--ocr <provider>", "OCR provider: gemini, docling, mistral_ocr", "gemini")
+  .option("--ocr <provider>", "OCR provider: gemini, gemini_pages, docling", "gemini_pages")
   .option("-o, --output <dir>", "Output directory")
   .option("--json", "Also save JSON version of each page")
   .action(async (file, options) => {
@@ -295,7 +295,8 @@ async function extractPages(file, options) {
     const form = new FormData();
     form.append("file", fs.createReadStream(filePath));
 
-    const ocrProvider = options.ocr === "gemini" ? "gemini_ocr" : options.ocr;
+    const ocrProvider = options.ocr === "gemini" ? "gemini_ocr" :
+                        options.ocr === "gemini_pages" ? "gemini_ocr_pages" : options.ocr;
     const url = `${API_URL}/pages?config=${options.config}&ocr_provider=${ocrProvider}`;
     const response = await fetch(url, {
       method: "POST",

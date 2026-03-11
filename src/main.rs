@@ -117,6 +117,7 @@ impl OcrRegistry {
             .map(|k| match k {
                 OcrProviderKind::Docling => "docling",
                 OcrProviderKind::GeminiOcr => "gemini_ocr",
+                OcrProviderKind::GeminiOcrPages => "gemini_ocr_pages",
                 OcrProviderKind::MistralOcr => "mistral_ocr",
                 OcrProviderKind::SmolDocling => "smol_docling",
             })
@@ -338,6 +339,17 @@ async fn main() -> anyhow::Result<()> {
         }
         Err(_) => {
             info!("OCR provider skipped: gemini_ocr (GEMINI_API_KEY not set)");
+        }
+    }
+
+    // Gemini page-by-page OCR (uses pdftoppm to convert each page to image)
+    match ocr::gemini_pages::GeminiPageByPageProvider::from_env(http_client.clone()) {
+        Ok(provider) => {
+            ocr_providers.insert(OcrProviderKind::GeminiOcrPages, Arc::new(provider));
+            info!("OCR provider registered: gemini_ocr_pages");
+        }
+        Err(_) => {
+            info!("OCR provider skipped: gemini_ocr_pages (GEMINI_API_KEY not set)");
         }
     }
 
