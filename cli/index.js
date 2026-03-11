@@ -35,6 +35,8 @@ program
   .option("--ocr <provider>", "OCR provider: gemini, docling, mistral_ocr", "gemini")
   .option("-o, --output <file>", "Output file path")
   .option("--md", "Also save markdown version")
+  .option("--page", "Page-by-page mode (finer granularity, uses Gemini)")
+  .option("--model <name>", "Model for page mode", "gemini-2.5-flash-lite-preview")
   .action(async (file, options) => {
     await detectSections(file, options);
   });
@@ -269,27 +271,31 @@ async function detectSections(file, options) {
     process.exit(1);
   }
 
+  const mode = options.page ? "page" : "full";
+
   console.log(chalk.blue("Document Section Detection"));
   console.log(chalk.gray("─".repeat(40)));
-  console.log(`File: ${chalk.white(path.basename(filePath))}`);
-  console.log(`OCR:  ${chalk.white(options.ocr)}`);
-  console.log(`API:  ${chalk.gray(API_URL)}`);
+  console.log(`File:  ${chalk.white(path.basename(filePath))}`);
+  console.log(`OCR:   ${chalk.white(options.ocr)}`);
+  console.log(`Mode:  ${chalk.white(mode)}${options.page ? chalk.gray(` (${options.model})`) : ""}`);
+  console.log(`API:   ${chalk.gray(API_URL)}`);
   console.log();
 
-  const spinner = ora("Detecting sections...").start();
+  const spinner = ora(options.page ? "Detecting sections page-by-page..." : "Detecting sections...").start();
 
   try {
     const form = new FormData();
     form.append("file", fs.createReadStream(filePath));
 
     const ocrProvider = options.ocr === "gemini" ? "gemini_ocr" : options.ocr;
-    const response = await fetch(
-      `${API_URL}/sections?config=${options.config}&ocr_provider=${ocrProvider}&format=markdown`,
-      {
-        method: "POST",
-        body: form,
-      }
-    );
+    let url = `${API_URL}/sections?config=${options.config}&ocr_provider=${ocrProvider}&format=markdown&mode=${mode}`;
+    if (options.page && options.model) {
+      url += `&model=${encodeURIComponent(options.model)}`;
+    }
+    const response = await fetch(url, {
+      method: "POST",
+      body: form,
+    });
 
     if (!response.ok) {
       const error = await response.text();

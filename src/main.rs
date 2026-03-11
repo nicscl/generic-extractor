@@ -514,10 +514,18 @@ struct SectionsQuery {
     ocr_provider: Option<String>,
     /// Return format: "json" (default) or "markdown"
     format: Option<String>,
+    /// Detection mode: "full" (default) or "page" (page-by-page with Gemini)
+    mode: Option<String>,
+    /// Model for page-by-page mode (default: gemini-2.5-flash-lite-preview)
+    model: Option<String>,
 }
 
 /// Lightweight document section detection.
 /// Returns section names with page ranges without full extraction.
+///
+/// Query params:
+///   - `mode` — "full" (default) or "page" (page-by-page with Gemini)
+///   - `model` — Gemini model for page mode (default: gemini-2.5-flash-lite-preview)
 async fn detect_sections(
     State(state): State<AppState>,
     Query(query): Query<SectionsQuery>,
@@ -542,7 +550,10 @@ async fn detect_sections(
     // Read file input
     let (filename, file_data) = read_file_input(multipart, query.file_url.as_deref()).await?;
 
-    info!("Section detection for {} (ocr={})", filename, provider.name());
+    // Determine detection mode
+    let mode = sections::DetectionMode::from_str(query.mode.as_deref().unwrap_or("full"));
+
+    info!("Section detection for {} (ocr={}, mode={:?})", filename, provider.name(), mode);
 
     // Build OCR input
     let ocr_input = if let Some(file_url) = &query.file_url {
@@ -563,13 +574,24 @@ async fn detect_sections(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("OCR failed: {}", e)))?;
 
-    // Get default LLM client for section detection
-    let llm_client = state.llm.resolve(&config);
-
-    // Run section detection
-    let sections_result = sections::detect_sections(llm_client, &ocr_result)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Section detection failed: {}", e)))?;
+    // Run section detection based on mode
+    let sections_result = match mode {
+        sections::DetectionMode::Page => {
+            sections::detect_sections_page_by_page(
+                &state.http_client,
+                &ocr_result,
+                query.model.as_deref(),
+            )
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Page-by-page detection failed: {}", e)))?
+        }
+        sections::DetectionMode::Full => {
+            let llm_client = state.llm.resolve(&config);
+            sections::detect_sections(llm_client, &ocr_result)
+                .await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Section detection failed: {}", e)))?
+        }
+    };
 
     // Return based on format
     let format = query.format.as_deref().unwrap_or("json");
