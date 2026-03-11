@@ -29,6 +29,17 @@ program
   });
 
 program
+  .command("sections <file>")
+  .description("Detect document sections with page ranges (lightweight, no full extraction)")
+  .option("-c, --config <name>", "Extraction config to use", "legal_br")
+  .option("--ocr <provider>", "OCR provider: gemini, docling, mistral_ocr", "gemini")
+  .option("-o, --output <file>", "Output file path")
+  .option("--md", "Also save markdown version")
+  .action(async (file, options) => {
+    await detectSections(file, options);
+  });
+
+program
   .command("status <id>")
   .description("Check extraction status")
   .action(async (id) => {
@@ -237,6 +248,115 @@ async function saveAndDisplayResult(result, originalFile, outputPath) {
       const color = reason === "STOP" ? chalk.green : chalk.yellow;
       console.log(`${chalk.cyan("Status")}: ${color(reason)}`);
     }
+  }
+}
+
+async function detectSections(file, options) {
+  // Resolve file path
+  let filePath = file;
+  if (!path.isAbsolute(file)) {
+    const testDocPath = path.join(TEST_DOCS_DIR, file);
+    if (fs.existsSync(testDocPath)) {
+      filePath = testDocPath;
+    } else if (!fs.existsSync(file)) {
+      console.error(chalk.red(`File not found: ${file}`));
+      process.exit(1);
+    }
+  }
+
+  if (!fs.existsSync(filePath)) {
+    console.error(chalk.red(`File not found: ${filePath}`));
+    process.exit(1);
+  }
+
+  console.log(chalk.blue("Document Section Detection"));
+  console.log(chalk.gray("─".repeat(40)));
+  console.log(`File: ${chalk.white(path.basename(filePath))}`);
+  console.log(`OCR:  ${chalk.white(options.ocr)}`);
+  console.log(`API:  ${chalk.gray(API_URL)}`);
+  console.log();
+
+  const spinner = ora("Detecting sections...").start();
+
+  try {
+    const form = new FormData();
+    form.append("file", fs.createReadStream(filePath));
+
+    const ocrProvider = options.ocr === "gemini" ? "gemini_ocr" : options.ocr;
+    const response = await fetch(
+      `${API_URL}/sections?config=${options.config}&ocr_provider=${ocrProvider}&format=markdown`,
+      {
+        method: "POST",
+        body: form,
+      }
+    );
+
+    if (!response.ok) {
+      const error = await response.text();
+      spinner.fail("Section detection failed");
+      console.error(chalk.red(error));
+      process.exit(1);
+    }
+
+    const result = await response.json();
+    spinner.succeed(`Detected ${result.sections?.length || 0} sections`);
+
+    // Ensure output directory exists
+    if (!fs.existsSync(OUTPUT_DIR)) {
+      fs.mkdirSync(OUTPUT_DIR, { recursive: true });
+    }
+
+    // Generate output filename
+    const basename = path.basename(filePath, path.extname(filePath));
+    const timestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+    const outFile = options.output || path.join(OUTPUT_DIR, `${basename}_sections_${timestamp}.json`);
+
+    // Save JSON result
+    fs.writeFileSync(outFile, JSON.stringify(result, null, 2));
+    console.log(chalk.green(`\nSaved: ${outFile}`));
+
+    // Save markdown if requested
+    if (options.md && result.markdown) {
+      const mdFile = outFile.replace(/\.json$/, ".md");
+      fs.writeFileSync(mdFile, result.markdown);
+      console.log(chalk.green(`Markdown: ${mdFile}`));
+    }
+
+    // Display sections table
+    console.log(chalk.blue("\nDocument Sections"));
+    console.log(chalk.gray("─".repeat(50)));
+    console.log(chalk.gray("Section".padEnd(35) + "Type".padEnd(15) + "Pages"));
+    console.log(chalk.gray("─".repeat(50)));
+
+    for (const section of result.sections || []) {
+      const name = (section.name || "").substring(0, 33).padEnd(35);
+      const type = (section.section_type || "-").substring(0, 13).padEnd(15);
+      const pages = section.page_start === section.page_end
+        ? `p${section.page_start}`
+        : `p${section.page_start}-${section.page_end}`;
+      console.log(`${chalk.white(name)}${chalk.cyan(type)}${chalk.yellow(pages)}`);
+    }
+
+    // Display OCR metadata if present
+    if (result.ocr_metadata) {
+      const ocr = result.ocr_metadata;
+      console.log(chalk.blue("\nOCR Info"));
+      console.log(chalk.gray("─".repeat(40)));
+      if (ocr.provider) {
+        console.log(`${chalk.cyan("Provider")}: ${ocr.provider} (${ocr.model || "?"})`);
+      }
+      if (ocr.cost_usd !== undefined) {
+        console.log(`${chalk.cyan("Cost")}: $${ocr.cost_usd.toFixed(4)}`);
+      }
+    }
+
+  } catch (err) {
+    spinner.fail("Request failed");
+    console.error(chalk.red(err.message));
+    if (err.cause?.code === "ECONNREFUSED") {
+      console.log(chalk.yellow("\nIs the server running? Try: make run"));
+    }
+    process.exit(1);
   }
 }
 

@@ -10,6 +10,7 @@ mod ocr;
 mod paperspace;
 mod openrouter;
 mod schema;
+mod sections;
 mod sheet_extractor;
 mod sheet_parser;
 mod sheet_schema;
@@ -371,6 +372,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/configs", get(list_configs).post(create_config))
         .route("/configs/:name", get(get_config).put(update_config).delete(delete_config))
         .route("/extract", post(extract_document))
+        .route("/sections", post(detect_sections))
         .route("/extractions", get(list_extractions))
         .route("/extractions/:id/snapshot", get(get_extraction_snapshot))
         .route("/extractions/:id", get(get_extraction))
@@ -503,6 +505,84 @@ struct ExtractQuery {
     callback_url: Option<String>,
     ocr_provider: Option<String>,
     readable_id: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct SectionsQuery {
+    config: Option<String>,
+    file_url: Option<String>,
+    ocr_provider: Option<String>,
+    /// Return format: "json" (default) or "markdown"
+    format: Option<String>,
+}
+
+/// Lightweight document section detection.
+/// Returns section names with page ranges without full extraction.
+async fn detect_sections(
+    State(state): State<AppState>,
+    Query(query): Query<SectionsQuery>,
+    multipart: Option<Multipart>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    // Get config (just for OCR provider resolution)
+    let config_name = query.config.as_deref().unwrap_or("legal_br");
+    let config = state.configs.get(config_name).ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("Unknown config: {}", config_name),
+        )
+    })?;
+    let config = Arc::new(config);
+
+    // Resolve OCR provider
+    let provider = state
+        .ocr
+        .resolve(&config, query.ocr_provider.as_deref())
+        .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+
+    // Read file input
+    let (filename, file_data) = read_file_input(multipart, query.file_url.as_deref()).await?;
+
+    info!("Section detection for {} (ocr={})", filename, provider.name());
+
+    // Build OCR input
+    let ocr_input = if let Some(file_url) = &query.file_url {
+        OcrInput::Url {
+            filename: filename.clone(),
+            url: file_url.clone(),
+        }
+    } else {
+        OcrInput::Bytes {
+            filename: filename.clone(),
+            data: file_data,
+        }
+    };
+
+    // Run OCR
+    let ocr_result = provider
+        .process(&ocr_input)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("OCR failed: {}", e)))?;
+
+    // Get default LLM client for section detection
+    let llm_client = state.llm.resolve(&config);
+
+    // Run section detection
+    let sections_result = sections::detect_sections(llm_client, &ocr_result)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Section detection failed: {}", e)))?;
+
+    // Return based on format
+    let format = query.format.as_deref().unwrap_or("json");
+    if format == "markdown" {
+        Ok(Json(serde_json::json!({
+            "markdown": sections_result.to_markdown(),
+            "sections": sections_result.sections,
+            "total_pages": sections_result.total_pages,
+            "ocr_metadata": sections_result.ocr_metadata
+        })))
+    } else {
+        Ok(Json(serde_json::to_value(&sections_result).unwrap()))
+    }
 }
 
 /// Upload a document and start async extraction using OCR + LLM.
