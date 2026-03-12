@@ -28,6 +28,7 @@ pub struct OcrResult {
 }
 
 /// Input to an OCR provider — either raw bytes or a remote URL.
+#[derive(Clone)]
 pub enum OcrInput {
     Bytes { filename: String, data: Vec<u8> },
     Url { filename: String, url: String },

@@ -386,6 +386,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/extract", post(extract_document))
         .route("/sections", post(detect_sections))
         .route("/pages", post(extract_pages))
+        .route("/compare", post(compare_ocr_modes))
         .route("/extractions", get(list_extractions))
         .route("/extractions/:id/snapshot", get(get_extraction_snapshot))
         .route("/extractions/:id", get(get_extraction))
@@ -597,6 +598,165 @@ async fn extract_pages(
         })).collect::<Vec<_>>(),
         "metadata": ocr_result.metadata
     })))
+}
+
+#[derive(serde::Deserialize)]
+struct CompareQuery {
+    config: Option<String>,
+    file_url: Option<String>,
+}
+
+/// Compare OCR modes: whole-doc vs page-by-page.
+/// Returns both outputs with cost comparison and quality metrics.
+async fn compare_ocr_modes(
+    State(state): State<AppState>,
+    Query(query): Query<CompareQuery>,
+    multipart: Option<Multipart>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let config_name = query.config.as_deref().unwrap_or("legal_br");
+    let config = state.configs.get(config_name).ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("Unknown config: {}", config_name),
+        )
+    })?;
+    let config = Arc::new(config);
+
+    // Read file input
+    let (filename, file_data) = read_file_input(multipart, query.file_url.as_deref()).await?;
+    info!("OCR comparison for {}", filename);
+
+    let ocr_input = OcrInput::Bytes {
+        filename: filename.clone(),
+        data: file_data,
+    };
+
+    // Resolve both OCR providers
+    let whole_doc_provider = state.ocr.resolve(&config, Some("gemini_ocr")).ok();
+    let pages_provider = state.ocr.resolve(&config, Some("gemini_ocr_pages")).ok();
+
+    // Run both in parallel
+    let ocr_input_clone = ocr_input.clone();
+    let whole_doc_future = async {
+        if let Some(provider) = whole_doc_provider {
+            let start = std::time::Instant::now();
+            let result = provider.process(&ocr_input).await;
+            Some((result, start.elapsed()))
+        } else {
+            None
+        }
+    };
+
+    let pages_future = async {
+        if let Some(provider) = pages_provider {
+            let start = std::time::Instant::now();
+            let result = provider.process(&ocr_input_clone).await;
+            Some((result, start.elapsed()))
+        } else {
+            None
+        }
+    };
+
+    // Execute both in parallel
+    let (whole_doc, pages) = tokio::join!(whole_doc_future, pages_future);
+
+    // Build comparison response
+    let mut modes = serde_json::Map::new();
+
+    if let Some((Ok(result), elapsed)) = whole_doc {
+        modes.insert("whole_doc".to_string(), serde_json::json!({
+            "provider": result.provider_name,
+            "total_pages": result.total_pages,
+            "output_chars": result.markdown.len(),
+            "elapsed_ms": elapsed.as_millis(),
+            "metadata": result.metadata,
+            "markdown": result.markdown,
+        }));
+    }
+
+    if let Some((Ok(result), elapsed)) = pages {
+        let combined_chars: usize = result.pages.iter().map(|p| p.text.len()).sum();
+        modes.insert("page_by_page".to_string(), serde_json::json!({
+            "provider": result.provider_name,
+            "total_pages": result.total_pages,
+            "output_chars": combined_chars,
+            "elapsed_ms": elapsed.as_millis(),
+            "metadata": result.metadata,
+            "pages": result.pages.iter().map(|p| serde_json::json!({
+                "page_num": p.page_num,
+                "text": p.text,
+                "chars": p.text.len(),
+            })).collect::<Vec<_>>(),
+        }));
+    }
+
+    // Calculate comparison metrics
+    let comparison = calculate_comparison(&modes);
+
+    Ok(Json(serde_json::json!({
+        "filename": filename,
+        "modes": modes,
+        "comparison": comparison,
+    })))
+}
+
+/// Calculate comparison metrics between OCR modes.
+fn calculate_comparison(modes: &serde_json::Map<String, serde_json::Value>) -> serde_json::Value {
+    let whole_doc = modes.get("whole_doc");
+    let page_by_page = modes.get("page_by_page");
+
+    let mut comparison = serde_json::Map::new();
+
+    // Extract costs
+    let whole_cost = whole_doc
+        .and_then(|m| m.get("metadata"))
+        .and_then(|m| m.get("cost_usd"))
+        .and_then(|v| v.as_f64());
+    let pages_cost = page_by_page
+        .and_then(|m| m.get("metadata"))
+        .and_then(|m| m.get("cost_usd"))
+        .and_then(|v| v.as_f64());
+
+    if let (Some(wc), Some(pc)) = (whole_cost, pages_cost) {
+        let diff = pc - wc;
+        let pct = if wc > 0.0 { (diff / wc) * 100.0 } else { 0.0 };
+        comparison.insert("cost_diff_usd".to_string(), serde_json::json!(diff));
+        comparison.insert("cost_diff_pct".to_string(), serde_json::json!(pct));
+        comparison.insert("cheaper_mode".to_string(),
+            serde_json::json!(if diff < 0.0 { "page_by_page" } else { "whole_doc" }));
+    }
+
+    // Extract token counts
+    let whole_tokens = whole_doc
+        .and_then(|m| m.get("metadata"))
+        .and_then(|m| m.get("token_usage"))
+        .and_then(|m| m.get("total_tokens"))
+        .and_then(|v| v.as_i64());
+    let pages_tokens = page_by_page
+        .and_then(|m| m.get("metadata"))
+        .and_then(|m| m.get("token_usage"))
+        .and_then(|m| m.get("total_tokens"))
+        .and_then(|v| v.as_i64());
+
+    if let (Some(wt), Some(pt)) = (whole_tokens, pages_tokens) {
+        let diff = pt - wt;
+        let pct = if wt > 0 { (diff as f64 / wt as f64) * 100.0 } else { 0.0 };
+        comparison.insert("token_diff".to_string(), serde_json::json!(diff));
+        comparison.insert("token_diff_pct".to_string(), serde_json::json!(pct));
+    }
+
+    // Compare output sizes
+    let whole_chars = whole_doc.and_then(|m| m.get("output_chars")).and_then(|v| v.as_i64());
+    let pages_chars = page_by_page.and_then(|m| m.get("output_chars")).and_then(|v| v.as_i64());
+
+    if let (Some(wc), Some(pc)) = (whole_chars, pages_chars) {
+        let diff = pc - wc;
+        comparison.insert("output_chars_diff".to_string(), serde_json::json!(diff));
+        comparison.insert("more_output".to_string(),
+            serde_json::json!(if diff > 0 { "page_by_page" } else { "whole_doc" }));
+    }
+
+    serde_json::Value::Object(comparison)
 }
 
 /// Lightweight document section detection.

@@ -73,6 +73,15 @@ program
     listTestDocs();
   });
 
+program
+  .command("compare <file>")
+  .description("Compare OCR modes: whole-doc vs page-by-page")
+  .option("-c, --config <name>", "Extraction config to use", "legal_br")
+  .option("-o, --output <dir>", "Output directory for comparison")
+  .action(async (file, options) => {
+    await compareOcrModes(file, options);
+  });
+
 program.parse();
 
 async function runExtraction(file, options) {
@@ -614,4 +623,186 @@ function formatBytes(bytes) {
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function compareOcrModes(file, options) {
+  // Resolve file path
+  let filePath = file;
+  if (!path.isAbsolute(file)) {
+    const testDocPath = path.join(TEST_DOCS_DIR, file);
+    if (fs.existsSync(testDocPath)) {
+      filePath = testDocPath;
+    } else if (!fs.existsSync(file)) {
+      console.error(chalk.red(`File not found: ${file}`));
+      process.exit(1);
+    }
+  }
+
+  if (!fs.existsSync(filePath)) {
+    console.error(chalk.red(`File not found: ${filePath}`));
+    process.exit(1);
+  }
+
+  const basename = path.basename(filePath, path.extname(filePath));
+  const timestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+  const compareDir = options.output || path.join(OUTPUT_DIR, `compare_${basename}_${timestamp}`);
+
+  if (!fs.existsSync(compareDir)) {
+    fs.mkdirSync(compareDir, { recursive: true });
+  }
+
+  console.log(chalk.blue("OCR Mode Comparison"));
+  console.log(chalk.gray("─".repeat(50)));
+  console.log(`File:   ${chalk.white(path.basename(filePath))}`);
+  console.log(`Output: ${chalk.white(compareDir)}`);
+  console.log();
+
+  const spinner = ora("Running both OCR modes in parallel...").start();
+
+  try {
+    const form = new FormData();
+    form.append("file", fs.createReadStream(filePath));
+
+    const response = await fetch(
+      `${API_URL}/compare?config=${options.config}`,
+      { method: "POST", body: form }
+    );
+
+    if (!response.ok) {
+      const error = await response.text();
+      spinner.fail("Comparison failed");
+      console.error(chalk.red(error));
+      process.exit(1);
+    }
+
+    const result = await response.json();
+    spinner.succeed("Both OCR modes completed");
+
+    // Save outputs
+    const modes = result.modes || {};
+
+    // Save whole_doc output
+    if (modes.whole_doc) {
+      const wholeDocDir = path.join(compareDir, "whole_doc");
+      fs.mkdirSync(wholeDocDir, { recursive: true });
+      fs.writeFileSync(path.join(wholeDocDir, "result.json"), JSON.stringify(modes.whole_doc, null, 2));
+      if (modes.whole_doc.markdown) {
+        fs.writeFileSync(path.join(wholeDocDir, "ocr_output.md"), modes.whole_doc.markdown);
+      }
+    }
+
+    // Save page_by_page output
+    if (modes.page_by_page) {
+      const pagesDir = path.join(compareDir, "page_by_page");
+      fs.mkdirSync(pagesDir, { recursive: true });
+      fs.writeFileSync(path.join(pagesDir, "metadata.json"), JSON.stringify(modes.page_by_page.metadata || {}, null, 2));
+
+      for (const page of modes.page_by_page.pages || []) {
+        const pageNum = String(page.page_num).padStart(2, "0");
+        fs.writeFileSync(path.join(pagesDir, `page_${pageNum}.md`), page.text || "");
+      }
+
+      const combinedMd = (modes.page_by_page.pages || [])
+        .map(p => `# Page ${p.page_num}\n\n${p.text}`)
+        .join("\n\n---\n\n");
+      fs.writeFileSync(path.join(pagesDir, "combined.md"), combinedMd);
+    }
+
+    // Display comparison
+    displayComparison(result, compareDir);
+
+  } catch (err) {
+    spinner.fail("Comparison failed");
+    console.error(chalk.red(err.message));
+    if (err.cause?.code === "ECONNREFUSED") {
+      console.log(chalk.yellow("\nIs the server running? Try: make run"));
+    }
+    process.exit(1);
+  }
+}
+
+function displayComparison(result, compareDir) {
+  const modes = result.modes || {};
+  const comp = result.comparison || {};
+
+  console.log(chalk.blue("\n" + "═".repeat(50)));
+  console.log(chalk.blue("COMPARISON SUMMARY"));
+  console.log(chalk.blue("═".repeat(50)));
+
+  // Whole doc stats
+  if (modes.whole_doc) {
+    const m = modes.whole_doc;
+    const ocr = m.metadata || {};
+
+    console.log(chalk.cyan("\nWhole Document:"));
+    console.log(`  Provider: ${m.provider || ocr.provider} (${ocr.model || "?"})`);
+    console.log(`  Time:     ${m.elapsed_ms}ms`);
+    if (ocr.token_usage) {
+      console.log(`  Tokens:   ${ocr.token_usage.prompt_tokens?.toLocaleString()} in / ${ocr.token_usage.output_tokens?.toLocaleString()} out`);
+      console.log(`  Total:    ${ocr.token_usage.total_tokens?.toLocaleString()} tokens`);
+    }
+    if (ocr.cost_usd !== undefined) {
+      console.log(`  Cost:     $${ocr.cost_usd.toFixed(4)}`);
+    }
+    console.log(`  Output:   ${(m.output_chars || 0).toLocaleString()} chars`);
+  }
+
+  // Page-by-page stats
+  if (modes.page_by_page) {
+    const m = modes.page_by_page;
+    const ocr = m.metadata || {};
+
+    console.log(chalk.cyan("\nPage-by-Page:"));
+    console.log(`  Provider: ${m.provider || ocr.provider} (${ocr.model || "?"})`);
+    console.log(`  Pages:    ${m.total_pages}`);
+    console.log(`  Time:     ${m.elapsed_ms}ms`);
+    if (ocr.token_usage) {
+      console.log(`  Tokens:   ${ocr.token_usage.prompt_tokens?.toLocaleString()} in / ${ocr.token_usage.output_tokens?.toLocaleString()} out`);
+      console.log(`  Total:    ${ocr.token_usage.total_tokens?.toLocaleString()} tokens`);
+    }
+    if (ocr.cost_usd !== undefined) {
+      console.log(`  Cost:     $${ocr.cost_usd.toFixed(4)}`);
+    }
+    console.log(`  Output:   ${(m.output_chars || 0).toLocaleString()} chars`);
+  }
+
+  // Show comparison from server
+  if (comp.cost_diff_usd !== undefined) {
+    console.log(chalk.yellow("\nCost Difference:"));
+    const diff = comp.cost_diff_usd;
+    const pct = comp.cost_diff_pct?.toFixed(1) || "0";
+    if (diff > 0) {
+      console.log(`  Page-by-page costs $${diff.toFixed(4)} more (+${pct}%)`);
+    } else if (diff < 0) {
+      console.log(`  Page-by-page costs $${Math.abs(diff).toFixed(4)} less (${pct}%)`);
+    } else {
+      console.log(`  Same cost`);
+    }
+    console.log(`  ${chalk.green("Cheaper:")} ${comp.cheaper_mode}`);
+  }
+
+  if (comp.token_diff !== undefined) {
+    console.log(chalk.yellow("\nToken Difference:"));
+    const diff = comp.token_diff;
+    const pct = comp.token_diff_pct?.toFixed(1) || "0";
+    if (diff > 0) {
+      console.log(`  Page-by-page uses ${diff.toLocaleString()} more tokens (+${pct}%)`);
+    } else if (diff < 0) {
+      console.log(`  Page-by-page uses ${Math.abs(diff).toLocaleString()} fewer tokens (${pct}%)`);
+    } else {
+      console.log(`  Same token usage`);
+    }
+  }
+
+  if (comp.output_chars_diff !== undefined) {
+    console.log(chalk.yellow("\nOutput Difference:"));
+    console.log(`  ${comp.more_output} produces ${Math.abs(comp.output_chars_diff).toLocaleString()} more chars`);
+  }
+
+  // Save full result
+  fs.writeFileSync(path.join(compareDir, "comparison.json"), JSON.stringify(result, null, 2));
+  console.log(chalk.green(`\nComparison saved to: ${compareDir}/`));
+  console.log(chalk.gray("  comparison.json - full comparison data"));
+  console.log(chalk.gray("  whole_doc/      - full document OCR output"));
+  console.log(chalk.gray("  page_by_page/   - per-page OCR output"));
 }
