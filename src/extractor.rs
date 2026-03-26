@@ -11,7 +11,7 @@ use crate::schema::{
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 /// Extraction pipeline orchestrator.
 pub struct Extractor {
@@ -100,15 +100,38 @@ impl Extractor {
 
         let messages = vec![Message::system(system_prompt), Message::user(user_prompt)];
 
-        // Call LLM for structure extraction
-        debug!("Calling LLM for structure extraction (document cached in system prompt)");
-        let response = self.client.chat(messages).await?;
+        // Call LLM for structure extraction (with retry)
+        let max_attempts = 3;
+        let mut last_err = None;
+        let mut extracted: Option<ExtractedStructure> = None;
 
-        debug!("Raw LLM response length: {} chars", response.len());
+        for attempt in 1..=max_attempts {
+            debug!("Calling LLM for structure extraction (attempt {}/{})", attempt, max_attempts);
+            let response = self.client.chat(messages.clone()).await?;
 
-        // Parse the JSON response
-        let extracted: ExtractedStructure =
-            parse_llm_json(&response).context("Failed to parse LLM structure response")?;
+            debug!("Raw LLM response length: {} chars", response.len());
+
+            match parse_llm_json::<ExtractedStructure>(&response) {
+                Ok(parsed) => {
+                    extracted = Some(parsed);
+                    break;
+                }
+                Err(e) => {
+                    warn!(
+                        "LLM structure parse failed (attempt {}/{}): {}. Response (first 2000 chars): {}",
+                        attempt,
+                        max_attempts,
+                        e,
+                        &response[..response.len().min(2000)]
+                    );
+                    last_err = Some(e);
+                }
+            }
+        }
+
+        let extracted = extracted.ok_or_else(|| {
+            last_err.unwrap_or_else(|| anyhow::anyhow!("Failed to parse LLM structure response"))
+        })?;
 
         // Build the Extraction object
         let mut extraction = Extraction::new(filename.to_string(), Some(config.name.clone()));

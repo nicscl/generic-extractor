@@ -475,18 +475,28 @@ impl DoclingProvider {
         let (filename, file_data) = match input {
             OcrInput::Bytes { filename, data } => (filename.clone(), data.clone()),
             OcrInput::Url { filename, url } => {
-                info!("DoclingProvider: downloading {} for sidecar", url);
-                let resp = self.client.get(url).send().await?;
-                if !resp.status().is_success() {
-                    let status = resp.status();
-                    let text = resp.text().await.unwrap_or_default();
-                    anyhow::bail!(
-                        "Failed to download file for Docling ({}): {}",
-                        status,
-                        text
-                    );
+                if url.starts_with("file://") {
+                    // Read directly from local filesystem
+                    let path = url.strip_prefix("file://").unwrap();
+                    let decoded_path = percent_encoding::percent_decode_str(path).decode_utf8_lossy();
+                    info!("DoclingProvider: reading local file {}", decoded_path);
+                    let data: Vec<u8> = tokio::fs::read(decoded_path.as_ref()).await
+                        .map_err(|e| anyhow::anyhow!("Failed to read local file {}: {}", decoded_path, e))?;
+                    (filename.clone(), data)
+                } else {
+                    info!("DoclingProvider: downloading {} for sidecar", url);
+                    let resp = self.client.get(url).send().await?;
+                    if !resp.status().is_success() {
+                        let status = resp.status();
+                        let text = resp.text().await.unwrap_or_default();
+                        anyhow::bail!(
+                            "Failed to download file for Docling ({}): {}",
+                            status,
+                            text
+                        );
+                    }
+                    (filename.clone(), resp.bytes().await?.to_vec())
                 }
-                (filename.clone(), resp.bytes().await?.to_vec())
             }
         };
 
